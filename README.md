@@ -166,6 +166,3 @@ Choose any trained model, fill in customer details (18 fields), and get an insta
 
 ---
 
-## 📄 License
-
-This project is open source and available under the [MIT License](LICENSE).
