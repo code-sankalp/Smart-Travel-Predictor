@@ -1,0 +1,1 @@
+{"is_imbalanced": true, "imbalance_ratio": 4.31, "severity": "severe", "minority_class": 1, "majority_class": 0, "minority_count": 920, "majority_count": 3968, "minority_percentage": 18.82, "recommended_method": "BorderlineSMOTE", "counts": {"1": 920, "0": 3968}}
