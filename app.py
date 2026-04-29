@@ -1,8 +1,13 @@
 """
-app.py  —  Trips & Travel Analytics Platform
-=============================================
+app.py  —  Trips & Travel Analytics Platform  (v2 — 2-Stage Pipeline)
+======================================================================
 Run: streamlit run app.py
-Requires: travel_dataset.csv (or cleaned_travel_dataset.csv) in same folder.
+Requires: travel_dataset.csv in same folder + analysis.py + prediction.py
+
+Stage 1 · Train All Models  → baseline training → best base learner
+Stage 2 · Hyperparameter Tuning → tunes ONLY the Stage-1 winner
+         Model Analysis     → analyses the final active model
+         Predict            → single + batch inference
 """
 
 import warnings
@@ -21,7 +26,7 @@ st.set_page_config(page_title="Trips & Travel — Analytics", page_icon="✈️"
                    layout="wide", initial_sidebar_state="expanded")
 
 # ══════════════════════════════════════════════════════════════════
-# CSS
+# CSS  (unchanged from v1 — all existing styling preserved)
 # ══════════════════════════════════════════════════════════════════
 st.markdown("""
 <style>
@@ -125,6 +130,15 @@ button[aria-selected="true"][data-baseweb="tab"]{background:linear-gradient(135d
 .target-banner-title{font-family:'Syne',sans-serif;font-size:.95rem;font-weight:800;color:#00D4FF;margin:0 0 .3rem;display:flex;align-items:center;gap:.5rem}
 .target-banner-body{font-size:.8rem;color:#8A9AB8;line-height:1.65;margin:0}
 .imbalance-chip{display:inline-block;padding:.18rem .6rem;border-radius:99px;background:rgba(255,60,172,.12);color:#FF3CAC;border:1px solid rgba(255,60,172,.3);font-size:.65rem;font-weight:700;letter-spacing:.1em;margin-left:.5rem}
+/* ── Pipeline status strip ── */
+.pipeline-strip{display:flex;gap:0;margin-bottom:1.2rem;border:1px solid rgba(255,255,255,.07);border-radius:10px;overflow:hidden;background:rgba(255,255,255,.02)}
+.ps{flex:1;padding:.6rem .9rem;font-size:.75rem;font-weight:600;border-right:1px solid rgba(255,255,255,.07);display:flex;align-items:center;gap:.4rem;color:#2E4060}
+.ps:last-child{border-right:none}
+.ps.done{color:#00E5A0;background:rgba(0,229,160,.04)}
+.ps.active{color:#00D4FF;background:rgba(0,212,255,.06)}
+/* ── tuned badge ── */
+.tuned-badge{display:inline-block;padding:.14rem .55rem;border-radius:99px;background:rgba(0,229,160,.13);color:#00E5A0;border:1px solid rgba(0,229,160,.3);font-size:.65rem;font-weight:700;letter-spacing:.1em;vertical-align:middle;margin-left:.35rem}
+.base-badge{display:inline-block;padding:.14rem .55rem;border-radius:99px;background:rgba(0,212,255,.1);color:#00D4FF;border:1px solid rgba(0,212,255,.25);font-size:.65rem;font-weight:700;letter-spacing:.1em;vertical-align:middle;margin-left:.35rem}
 @media(max-width:1150px){.kpi-grid{grid-template-columns:repeat(3,1fr)}.stat-counters{grid-template-columns:repeat(2,1fr)}}
 @media(max-width:760px){.kpi-grid{grid-template-columns:repeat(2,1fr)}}
 @media(max-width:480px){.kpi-grid{grid-template-columns:1fr}}
@@ -141,7 +155,6 @@ def card(label, pill=None):
     return c
 
 def _insight_panel(ins_list, rec_list):
-    """Render a two-column insight + recommendation panel."""
     if not (ins_list or rec_list):
         return
     col_left, col_right = st.columns(2, gap="medium")
@@ -168,24 +181,117 @@ def _insight_panel(ins_list, rec_list):
                 <span>{txt}</span></div>""", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
+def _locked_state(icon, title, body):
+    st.markdown(f"""<div style="text-align:center;padding:3.5rem 1rem;color:var(--txt2)">
+      <div style="font-size:3rem;margin-bottom:.8rem">{icon}</div>
+      <div style="font-family:'Syne',sans-serif;font-size:.95rem;font-weight:700;
+        color:var(--txt1);margin-bottom:.5rem">{title}</div>
+      <div style="font-size:.82rem;max-width:380px;margin:0 auto;line-height:1.6">{body}</div>
+    </div>""", unsafe_allow_html=True)
+
+def _pipeline_strip(base_done: bool, tuned_done: bool):
+    """Visual status bar showing which pipeline stages are complete."""
+    s1 = "done" if base_done  else "active"
+    s2 = "done" if tuned_done else ("active" if base_done else "")
+    s3 = "done" if (base_done or tuned_done) else ""
+    s4 = "done" if (base_done or tuned_done) else ""
+    st.markdown(f"""<div class="pipeline-strip">
+      <div class="ps {s1}">{"✅" if base_done else "🔄"} Stage 1 · Baseline Training</div>
+      <div class="ps {s2}">{"✅" if tuned_done else "⚙️"} Stage 2 · Hyperparameter Tuning</div>
+      <div class="ps {s3}">{"✅" if (base_done or tuned_done) else "🔒"} Model Analysis</div>
+      <div class="ps {s4}">{"✅" if (base_done or tuned_done) else "🔒"} Predict</div>
+    </div>""", unsafe_allow_html=True)
+
 # ── data ─────────────────────────────────────────────────────────
 @st.cache_data
 def _get_data(): return ana.load_cleaned()
 df = _get_data()
 
 # ── session state ────────────────────────────────────────────────
-DEFAULTS = {"page":"overview","analysis_tab":"univariate",
-            "model":None,"model_name":None,"model_type":None,
-            "train_result":None}
-for k,v in DEFAULTS.items():
-    if k not in st.session_state: st.session_state[k]=v
+DEFAULTS = {
+    "page"          : "overview",
+    "analysis_tab"  : "univariate",
+    "train_result"  : None,   # Stage-1 result dict (in memory)
+    "tune_result"   : None,   # Stage-2 result dict (in memory)
+}
+for k, v in DEFAULTS.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
-# ── auto-load saved artefacts ────────────────────────────────────
-if st.session_state.model is None and pred.artefacts_exist():
-    _arts = pred.load_artefacts()
-    if _arts:
-        st.session_state.model      = _arts["model"]
-        st.session_state.model_name = _arts["meta"]["best_name"]
+# ── auto-load saved artefacts on every script rerun ──────────────
+# Guard directly on file existence — avoids the old _prod gate that
+# could silently swallow load errors and leave session_state None.
+
+if st.session_state.train_result is None and pred.base_artefacts_exist():
+    try:
+        _base_auto = pred.load_base_artefacts()
+        if _base_auto:
+            _meta = _base_auto["meta"]
+            st.session_state.train_result = {
+                "best_model"    : _base_auto["model"],
+                "best_name"     : _meta["best_name"],
+                "models"        : {_meta["best_name"]: _base_auto["model"]},
+                "results_df"    : _meta.get("results_df", pd.DataFrame()),
+                "scaler"        : _base_auto["scaler"],
+                "le_dict"       : _base_auto["le_dict"],
+                "feature_names" : _meta.get("feature_names", _base_auto.get("feature_names", [])),
+                "X_test"        : _meta.get("X_test"),
+                "X_test_sc"     : _meta.get("X_test_sc"),
+                "best_X_test"   : _meta.get("best_X_test"),
+                "y_test"        : _meta.get("y_test"),
+                "balance_method": _meta.get("balance_method", "N/A"),
+                "before_balance": _meta.get("before_balance", {}),
+                "after_balance" : _meta.get("after_balance", {}),
+                "stage"         : _meta.get("stage", "baseline"),
+                "tuned"         : False,
+                "X_train_raw"   : _meta.get("X_train_raw"),
+                "y_train_raw"   : _meta.get("y_train_raw"),
+            }
+    except Exception:
+        pass  # silently skip — user sees "train first" prompt
+
+if st.session_state.tune_result is None and pred.tuned_artefacts_exist():
+    try:
+        _tuned_auto = pred.load_tuned_artefacts()
+        if _tuned_auto:
+            _tmeta = _tuned_auto["meta"]
+            st.session_state.tune_result = {
+                "tuned_model"        : _tuned_auto["model"],
+                "best_name"          : _tmeta["best_name"],
+                "best_params"        : _tmeta.get("best_params", {}),
+                "best_cv_f1"         : _tmeta.get("best_cv_f1"),
+                "scaler"             : _tuned_auto["scaler"],
+                "le_dict"            : _tuned_auto["le_dict"],
+                "feature_names"      : _tmeta.get("feature_names", _tuned_auto.get("feature_names", [])),
+                "X_test"             : _tmeta.get("X_test"),
+                "X_test_sc"          : _tmeta.get("X_test_sc"),
+                "best_X_test"        : _tmeta.get("best_X_test"),
+                "y_test"             : _tmeta.get("y_test"),
+                "tuning_search_space": _tmeta.get("tuning_search_space", {}),
+                "comparison"         : _tmeta.get("comparison", {}),
+                "baseline_metrics"   : _tmeta.get("baseline_metrics", {}),
+                "tuned_metrics"      : _tmeta.get("tuned_metrics", {}),
+                "balance_method"     : _tmeta.get("balance_method", "N/A"),
+                "before_balance"     : _tmeta.get("before_balance", {}),
+                "after_balance"      : _tmeta.get("after_balance", {}),
+                "stage"              : "tuned",
+                "tuned"              : True,
+            }
+    except Exception:
+        pass  # silently skip
+
+# ── helpers to get current production model info ──────────────────
+def _get_prod_model():
+    """Returns (model, name, scaler, le_dict, feature_names, is_tuned)."""
+    if st.session_state.tune_result:
+        r = st.session_state.tune_result
+        return (r["tuned_model"], r["best_name"], r["scaler"],
+                r["le_dict"], r["feature_names"], True)
+    if st.session_state.train_result:
+        r = st.session_state.train_result
+        return (r["best_model"], r["best_name"], r["scaler"],
+                r["le_dict"], r["feature_names"], False)
+    return (None, None, None, None, None, False)
 
 # ══════════════════════════════════════════════════════════════════
 # SIDEBAR
@@ -196,12 +302,12 @@ with st.sidebar:
     <span class="sb-sub">Analytics Platform</span></div>""", unsafe_allow_html=True)
 
     st.markdown("<span class='sb-lbl'>Navigation</span>", unsafe_allow_html=True)
-    for key,ico,label in [("overview","🏠","Overview"),("analysis","📊","Analysis"),("prediction","🤖","Prediction")]:
-        if st.button(f"{ico}  {label}", key=f"nav_{key}", use_container_width=True):
-            st.session_state.page=key; st.rerun()
+    for key, ico, label in [("overview","🏠","Overview"), ("analysis","📊","Analysis"), ("prediction","🤖","Prediction")]:
+        if st.button(f"{ico}  {label}", key=f"nav_{key}", width='stretch'):
+            st.session_state.page = key; st.rerun()
 
     st.markdown("<hr>", unsafe_allow_html=True)
-    if st.session_state.page in ("overview","analysis"):
+    if st.session_state.page in ("overview", "analysis"):
         st.markdown("<span class='sb-lbl'>Filters</span>", unsafe_allow_html=True)
         gender_f = st.multiselect("Gender", df["Gender"].unique(), default=list(df["Gender"].unique()), label_visibility="collapsed")
         st.markdown("<span class='sb-lbl'>Gender</span>", unsafe_allow_html=True)
@@ -209,38 +315,53 @@ with st.sidebar:
         st.markdown("<span class='sb-lbl'>City Tier</span>", unsafe_allow_html=True)
         occ_f    = st.multiselect("Occupation", df["Occupation"].unique(), default=list(df["Occupation"].unique()), label_visibility="collapsed")
         st.markdown("<span class='sb-lbl'>Occupation</span>", unsafe_allow_html=True)
-        imin,imax = int(df["MonthlyIncome"].min()), int(df["MonthlyIncome"].max())
-        inc_r = st.slider("Income", imin, imax, (imin,imax), step=1000, label_visibility="collapsed")
+        imin, imax = int(df["MonthlyIncome"].min()), int(df["MonthlyIncome"].max())
+        inc_r = st.slider("Income", imin, imax, (imin, imax), step=1000, label_visibility="collapsed")
         st.markdown("<span class='sb-lbl'>Monthly Income (₹)</span>", unsafe_allow_html=True)
     else:
         gender_f = list(df["Gender"].unique())
         city_f   = list(df["CityTier"].unique())
         occ_f    = list(df["Occupation"].unique())
-        imin,imax = int(df["MonthlyIncome"].min()), int(df["MonthlyIncome"].max())
-        inc_r = (imin,imax)
+        imin, imax = int(df["MonthlyIncome"].min()), int(df["MonthlyIncome"].max())
+        inc_r = (imin, imax)
 
-    # ── Model Status in sidebar ──
+    # ── Pipeline status in sidebar ────────────────────────────────
     st.markdown("<hr>", unsafe_allow_html=True)
-    st.markdown("<span class='sb-lbl'>Model Status</span>", unsafe_allow_html=True)
-    _active_name = None
-    if st.session_state.model_name:
-        _active_name = st.session_state.model_name
-    elif st.session_state.train_result:
-        _active_name = st.session_state.train_result["best_name"]
+    st.markdown("<span class='sb-lbl'>ML Pipeline</span>", unsafe_allow_html=True)
+
+    _base_done  = st.session_state.train_result is not None
+    _tuned_done = st.session_state.tune_result  is not None
+    _, _active_name, _, _, _, _is_tuned = _get_prod_model()
+
     if _active_name:
+        _badge = "<span class='tuned-badge'>TUNED ✓</span>" if _is_tuned else "<span class='base-badge'>BASELINE</span>"
         st.markdown(f"""<div style="background:rgba(0,229,160,.06);border:1px solid rgba(0,229,160,.25);
             border-radius:10px;padding:.55rem .75rem;font-size:.76rem;color:#00E5A0;font-weight:600">
-            🏆 Best Model<br><span style="font-family:'Syne',sans-serif;font-size:.85rem;
-            font-weight:800">{_active_name}</span></div>""", unsafe_allow_html=True)
+            🏆 Active Model<br>
+            <span style="font-family:'Syne',sans-serif;font-size:.85rem;font-weight:800">
+            {_active_name}</span>{_badge}</div>""", unsafe_allow_html=True)
+
+        _s1_clr = "#00E5A0" if _base_done  else "#2E4060"
+        _s2_clr = "#00E5A0" if _tuned_done else "#2E4060"
+        st.markdown(f"""<div style="margin-top:.5rem;display:grid;grid-template-columns:1fr 1fr;gap:.4rem">
+          <div style="background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.06);border-radius:8px;
+            padding:.4rem .6rem;text-align:center;font-size:.65rem;color:{_s1_clr};font-weight:700">
+            {"✅" if _base_done else "○"} Stage 1<br>Baseline</div>
+          <div style="background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.06);border-radius:8px;
+            padding:.4rem .6rem;text-align:center;font-size:.65rem;color:{_s2_clr};font-weight:700">
+            {"✅" if _tuned_done else "○"} Stage 2<br>Tuned</div>
+        </div>""", unsafe_allow_html=True)
     else:
         st.markdown("""<div style="background:rgba(255,181,71,.06);border:1px solid rgba(255,181,71,.2);
             border-radius:10px;padding:.55rem .75rem;font-size:.75rem;color:#FFB547">
-            ⚠️ No model trained yet</div>""", unsafe_allow_html=True)
+            ⚠️ No model trained yet<br>
+            <span style="font-size:.68rem;color:#4A5A6E">Go to Prediction → Train All Models</span>
+            </div>""", unsafe_allow_html=True)
 
 # ── filter ───────────────────────────────────────────────────────
-dff = df[df["Gender"].isin(gender_f) & df["CityTier"].isin(city_f) &
-         df["Occupation"].isin(occ_f) &
-         (df["MonthlyIncome"].between(inc_r[0],inc_r[1]) | df["MonthlyIncome"].isna())]
+dff  = df[df["Gender"].isin(gender_f) & df["CityTier"].isin(city_f) &
+          df["Occupation"].isin(occ_f) &
+          (df["MonthlyIncome"].between(inc_r[0], inc_r[1]) | df["MonthlyIncome"].isna())]
 kpis = ana.compute_kpis(dff)
 
 # ══════════════════════════════════════════════════════════════════
@@ -252,7 +373,6 @@ if st.session_state.page == "overview":
     <p class="pg-sub">Real-time customer behaviour &amp; conversion insights for strategic growth</p>
     <div class="pg-rule"></div>""", unsafe_allow_html=True)
 
-    # ── KPI GRID ─────────────────────────────────────────────────
     st.markdown(f"""<div class="kpi-grid">
       <div class="kpi kc"><div class="kpi-ic">👤</div>
         <span class="kpi-val" style="color:#00D4FF;-webkit-text-fill-color:#00D4FF">{kpis['total']:,}</span>
@@ -271,76 +391,58 @@ if st.session_state.page == "overview":
         <span class="kpi-lbl">Passport Holders</span><span class="kpi-sub">travel ready</span></div>
     </div>""", unsafe_allow_html=True)
 
-    c1,c2 = st.columns(2, gap="medium")
+    c1, c2 = st.columns(2, gap="medium")
     with c1:
-        with card("🎯 ProdTaken — Target Variable Distribution","Binary"):
-            st.plotly_chart(ana.fig_purchase_donut(dff), use_container_width=True)
+        with card("🎯 ProdTaken — Target Variable Distribution", "Binary"):
+            st.plotly_chart(ana.fig_purchase_donut(dff), width='stretch', key="plotly_chart_1")
     with c2:
-        with card("📦 Products Pitched","Inventory"):
-            st.plotly_chart(ana.fig_products_bar(dff), use_container_width=True)
-    c3,c4,c5 = st.columns(3, gap="medium")
+        with card("📦 Products Pitched", "Inventory"):
+            st.plotly_chart(ana.fig_products_bar(dff), width='stretch', key="plotly_chart_2")
+    c3, c4, c5 = st.columns(3, gap="medium")
     with c3:
         with card("👤 Age Distribution"):
-            st.plotly_chart(ana.fig_age_histogram(dff), use_container_width=True)
+            st.plotly_chart(ana.fig_age_histogram(dff), width='stretch', key="plotly_chart_3")
     with c4:
         with card("⚧ Gender Split"):
-            st.plotly_chart(ana.fig_gender_pie(dff), use_container_width=True)
+            st.plotly_chart(ana.fig_gender_pie(dff), width='stretch', key="plotly_chart_4")
     with c5:
         with card("🏙 City Tier"):
-            st.plotly_chart(ana.fig_city_tier_bar(dff), use_container_width=True)
+            st.plotly_chart(ana.fig_city_tier_bar(dff), width='stretch', key="plotly_chart_5")
 
-
-
-
-
-    cl,cr = st.columns([3,1])
+    cl, cr = st.columns([3, 1])
     with cl:
         all_cols = dff.columns.tolist()
         sel_cols = st.multiselect("cols", options=all_cols, default=all_cols[:8], label_visibility="collapsed")
     with cr:
-        n_rows = st.select_slider("rows", options=[10,25,50,100], value=10, label_visibility="collapsed")
-    st.dataframe((dff[sel_cols] if sel_cols else dff).head(n_rows), use_container_width=True, height=280)
-    # ── TARGET VARIABLE BANNER ───────────────────────────────────
+        n_rows = st.select_slider("rows", options=[10, 25, 50, 100], value=10, label_visibility="collapsed")
+    st.dataframe((dff[sel_cols] if sel_cols else dff).head(n_rows), width='stretch', height=280)
+
     n0 = int((dff["ProdTaken"] == 0).sum())
     n1 = int((dff["ProdTaken"] == 1).sum())
     total_tv = n0 + n1
     pct1 = round(n1 / max(total_tv, 1) * 100, 1)
     pct0 = round(n0 / max(total_tv, 1) * 100, 1)
     ratio = round(n0 / max(n1, 1), 2)
-    _bar_bought = round(pct1 * 2.2, 1)  # scale to max ~100 for CSS width
-    _bar_not = round(pct0 * 2.2, 1)
-    st.markdown(f"""
-                <div class="target-banner" style="padding:.75rem 1.1rem">
-                  <div style="display:flex;align-items:center;gap:.7rem;flex-wrap:wrap">
-                    <div class="target-banner-title" style="margin:0">🎯 Target Variable:
-                      <code style="background:rgba(0,212,255,.12);padding:.1rem .4rem;border-radius:5px;font-size:.82rem">ProdTaken</code>
-                      <span class="imbalance-chip">⚠️ Class Imbalance {ratio}:1</span>
-                    </div>
-                    <div style="display:flex;align-items:center;gap:1.2rem;margin-left:auto;flex-wrap:wrap">
-                      <div style="display:flex;align-items:center;gap:.45rem;font-size:.78rem">
-                        <div style="width:10px;height:10px;border-radius:50%;background:#00E5A0;flex-shrink:0"></div>
-                        <span style="color:#00E5A0;font-weight:700">{n1:,}</span>
-                        <span style="color:#6A7D9C">Purchased ({pct1}%)</span>
-                      </div>
-                      <div style="display:flex;align-items:center;gap:.45rem;font-size:.78rem">
-                        <div style="width:10px;height:10px;border-radius:50%;background:#FF3CAC;flex-shrink:0"></div>
-                        <span style="color:#FF3CAC;font-weight:700">{n0:,}</span>
-                        <span style="color:#6A7D9C">Not Purchased ({pct0}%)</span>
-                      </div>
-                      <div style="display:flex;gap:2px;align-items:center;height:18px;border-radius:4px;overflow:hidden;min-width:120px">
-                        <div style="width:{pct1:.0f}%;background:#00E5A0;height:100%;border-radius:3px 0 0 3px"></div>
-                        <div style="width:{pct0:.0f}%;background:#FF3CAC;height:100%;border-radius:0 3px 3px 0"></div>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-                """, unsafe_allow_html=True)
-    st.markdown(f"""<div style="display:flex;gap:1.2rem;margin-top:.5rem;padding-bottom:.2rem">
-      <span style="font-size:.7rem;color:var(--txt3)">Rows <strong style="color:var(--c-cyan)">{len(dff):,}</strong></span>
-      <span style="font-size:.7rem;color:var(--txt3)">Columns <strong style="color:var(--c-violet)">{len(dff.columns)}</strong></span>
-      <span style="font-size:.7rem;color:var(--txt3)">Missing <strong style="color:var(--c-amber)">{dff.isnull().sum().sum():,}</strong></span>
-      <span style="font-size:.7rem;color:var(--txt3)">Conversion <strong style="color:var(--c-green)">{kpis['conv_rate']:.1f}%</strong></span>
-    </div></div>""", unsafe_allow_html=True)
+    st.markdown(f"""<div class="target-banner" style="padding:.75rem 1.1rem">
+      <div style="display:flex;align-items:center;gap:.7rem;flex-wrap:wrap">
+        <div class="target-banner-title" style="margin:0">🎯 Target Variable:
+          <code style="background:rgba(0,212,255,.12);padding:.1rem .4rem;border-radius:5px;font-size:.82rem">ProdTaken</code>
+          <span class="imbalance-chip">⚠️ Class Imbalance {ratio}:1</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:1.2rem;margin-left:auto;flex-wrap:wrap">
+          <div style="display:flex;align-items:center;gap:.45rem;font-size:.78rem">
+            <div style="width:10px;height:10px;border-radius:50%;background:#00E5A0;flex-shrink:0"></div>
+            <span style="color:#00E5A0;font-weight:700">{n1:,}</span>
+            <span style="color:#6A7D9C">Purchased ({pct1}%)</span>
+          </div>
+          <div style="display:flex;align-items:center;gap:.45rem;font-size:.78rem">
+            <div style="width:10px;height:10px;border-radius:50%;background:#FF3CAC;flex-shrink:0"></div>
+            <span style="color:#FF3CAC;font-weight:700">{n0:,}</span>
+            <span style="color:#6A7D9C">Not Purchased ({pct0}%)</span>
+          </div>
+        </div>
+      </div>
+    </div>""", unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════════════
 # PAGE 2 — ANALYSIS
@@ -352,160 +454,106 @@ elif st.session_state.page == "analysis":
     <div class="pg-rule"></div>""", unsafe_allow_html=True)
 
     btncols = st.columns(3, gap="small")
-    for col,(key,label) in zip(btncols,[("univariate","📊 Univariate"),("bivariate","🔗 Bivariate"),("insights","💡 Insights")]):
+    for col, (key, label) in zip(btncols, [("univariate","📊 Univariate"), ("bivariate","🔗 Bivariate"), ("insights","💡 Insights")]):
         with col:
-            if st.button(label, key=f"tab_{key}", use_container_width=True):
-                st.session_state.analysis_tab=key; st.rerun()
+            if st.button(label, key=f"tab_{key}", width='stretch'):
+                st.session_state.analysis_tab = key; st.rerun()
 
-    anames = {"univariate":"📊 Univariate Analysis","bivariate":"🔗 Bivariate Analysis","insights":"💡 Insights & Recommendations"}
+    anames = {"univariate":"📊 Univariate Analysis", "bivariate":"🔗 Bivariate Analysis", "insights":"💡 Insights & Recommendations"}
     st.markdown(f"""<div class="active-tab-bar">▶ Active: {anames[st.session_state.analysis_tab]}</div>""", unsafe_allow_html=True)
 
-    # ═══ UNIVARIATE ═══════════════════════════════════════════════
+    # ═══ UNIVARIATE ═══
     if st.session_state.analysis_tab == "univariate":
         tab_num, tab_cat, tab_stats = st.tabs(["📊 Numeric","🏷 Categorical","📋 Stats"])
-
-        # ── Numeric ──
         with tab_num:
             num_cols = ana.get_numeric_cols(dff)
             st.markdown("<div class='chart-ctrl'>", unsafe_allow_html=True)
-            cc1,cc2,cc3 = st.columns([2,2,1])
-            with cc1:
-                sel_col = st.selectbox("📌 Select Column", num_cols, key="uni_num_col")
-            with cc2:
-                sel_chart = st.selectbox("📊 Chart Type", ana.UNIVARIATE_NUM_CHARTS, key="uni_num_chart")
+            cc1, cc2, cc3 = st.columns([2, 2, 1])
+            with cc1: sel_col   = st.selectbox("📌 Select Column", num_cols, key="uni_num_col")
+            with cc2: sel_chart = st.selectbox("📊 Chart Type", ana.UNIVARIATE_NUM_CHARTS, key="uni_num_chart")
             with cc3:
-                col_colors = {"Age":"#7B61FF","MonthlyIncome":"#FFB547","DurationOfPitch":"#00D4FF",
-                              "NumberOfTrips":"#FF3CAC","NumberOfFollowups":"#00E5A0"}
-                col_color = col_colors.get(sel_col,"#7B61FF")
-                chart_color = st.color_picker("Color", col_color, key="uni_num_color")
+                col_colors = {"Age":"#7B61FF","MonthlyIncome":"#FFB547","DurationOfPitch":"#00D4FF","NumberOfTrips":"#FF3CAC","NumberOfFollowups":"#00E5A0"}
+                chart_color = st.color_picker("Color", col_colors.get(sel_col, "#7B61FF"), key="uni_num_color")
             st.markdown("</div>", unsafe_allow_html=True)
-
             if sel_col:
                 with card(f"📊 {sel_col} — {sel_chart}"):
-                    st.plotly_chart(ana.fig_univariate(dff, sel_col, sel_chart, chart_color),
-                                    use_container_width=True)
+                    st.plotly_chart(ana.fig_univariate(dff, sel_col, sel_chart, chart_color), width='stretch', key="plotly_chart_6")
                     s = ana.get_numeric_summary(dff, sel_col)
-                    cols_s = st.columns(6)
-                    for col_s,(k,v) in zip(cols_s, s.items()):
+                    for col_s, (k, v) in zip(st.columns(6), s.items()):
                         with col_s: st.metric(k.capitalize(), v)
                 st.markdown("---")
                 st.markdown("#### 📊 Insights & Recommendations")
-                idata = ana.get_univariate_insights(dff, sel_col)
-                _insight_panel(idata["insights"], idata["recommendations"])
+                _insight_panel(*ana.get_univariate_insights(dff, sel_col).values())
 
-        # ── Categorical ──
         with tab_cat:
             cat_cols = ana.get_categorical_cols(dff)
             st.markdown("<div class='chart-ctrl'>", unsafe_allow_html=True)
             cc1, cc2, cc3, cc4 = st.columns([2, 2, 1, 1])
-            with cc1:
-                sel_col = st.selectbox("📌 Select Column", cat_cols, key="uni_cat_col")
-            with cc2:
-                sel_chart = st.selectbox("📊 Chart Type", ana.UNIVARIATE_CAT_CHARTS, key="uni_cat_chart")
-            with cc3:
-                start_color = st.color_picker("Start Color", "#0D1E38", key="start_color")
-            with cc4:
-                end_color = st.color_picker("End Color", "#00D4FF", key="end_color")
+            with cc1: sel_col   = st.selectbox("📌 Select Column", cat_cols, key="uni_cat_col")
+            with cc2: sel_chart = st.selectbox("📊 Chart Type", ana.UNIVARIATE_CAT_CHARTS, key="uni_cat_chart")
+            with cc3: start_color = st.color_picker("Start Color", "#0D1E38", key="start_color")
+            with cc4: end_color   = st.color_picker("End Color", "#00D4FF", key="end_color")
             st.markdown("</div>", unsafe_allow_html=True)
-
             if sel_col:
                 with card(f"🏷 {sel_col} — {sel_chart}"):
-                    # Pass both colors for bar charts
-                    if sel_chart in ["Bar Chart", "Horizontal Bar"]:
-                        st.plotly_chart(ana.fig_univariate(dff, sel_col, sel_chart,
-                                                           color=end_color, start_color=start_color),
-                                        use_container_width=True)
-                    else:
-                        st.plotly_chart(ana.fig_univariate(dff, sel_col, sel_chart, color=end_color),
-                                        use_container_width=True)
-
+                    kwargs = {"color": end_color, "start_color": start_color} if sel_chart in ["Bar Chart","Horizontal Bar"] else {"color": end_color}
+                    st.plotly_chart(ana.fig_univariate(dff, sel_col, sel_chart, **kwargs), width='stretch', key="plotly_chart_7")
                 vc = dff[sel_col].value_counts()
                 st.markdown(f"""<div style="display:flex;flex-wrap:wrap;gap:.6rem;margin-top:.3rem">
                 {''.join(f'<span style="font-size:.75rem;background:rgba(0,212,255,.07);border:1px solid rgba(0,212,255,.15);padding:.18rem .55rem;border-radius:99px;color:#EEF2FF"><strong>{v}</strong> <span style="color:#6A7D9C">{k}</span></span>' for k, v in vc.items())}
                 </div>""", unsafe_allow_html=True)
                 st.markdown("---")
-                st.markdown("#### 📊 Insights & Recommendations")
-                idata = ana.get_univariate_insights(dff, sel_col)
-                _insight_panel(idata["insights"], idata["recommendations"])
+                _insight_panel(*ana.get_univariate_insights(dff, sel_col).values())
 
-        # ── Stats ──
         with tab_stats:
-            with card("📋 Descriptive Statistics","Full Dataset"):
-                st.dataframe(dff.describe().round(2), use_container_width=True)
+            with card("📋 Descriptive Statistics", "Full Dataset"):
+                st.dataframe(dff.describe().round(2), width='stretch')
 
-    # ═══ BIVARIATE ════════════════════════════════════════════════
+    # ═══ BIVARIATE ═══
     elif st.session_state.analysis_tab == "bivariate":
         biv_tab1, biv_tab2 = st.tabs(["🔧 Custom Explorer","📌 Pre-built Charts"])
-
         with biv_tab1:
             all_cols = ana.get_all_cols(dff)
-            num_cols = ana.get_numeric_cols(dff)
             cat_cols = ana.get_categorical_cols(dff)
             st.markdown("<div class='chart-ctrl'>", unsafe_allow_html=True)
-            bcc1,bcc2,bcc3,bcc4 = st.columns([2,2,2,1])
-            with bcc1:
-                x_col = st.selectbox("X Axis (Column 1)", all_cols,
-                                     index=all_cols.index("MonthlyIncome") if "MonthlyIncome" in all_cols else 0,
-                                     key="biv_x")
-            with bcc2:
-                y_col = st.selectbox("Y Axis (Column 2)", all_cols,
-                                     index=all_cols.index("ProdTaken") if "ProdTaken" in all_cols else 1,
-                                     key="biv_y")
-            with bcc3:
-                chart_type = st.selectbox("📊 Chart Type", ana.BIVARIATE_CHART_TYPES, key="biv_chart")
-            with bcc4:
-                hue_col = st.selectbox("🎨 Colour by", ["None"]+cat_cols, key="biv_hue")
-                hue_col = None if hue_col=="None" else hue_col
+            bcc1, bcc2, bcc3, bcc4 = st.columns([2, 2, 2, 1])
+            with bcc1: x_col      = st.selectbox("X Axis", all_cols, index=all_cols.index("MonthlyIncome") if "MonthlyIncome" in all_cols else 0, key="biv_x")
+            with bcc2: y_col      = st.selectbox("Y Axis", all_cols, index=all_cols.index("ProdTaken") if "ProdTaken" in all_cols else 1, key="biv_y")
+            with bcc3: chart_type = st.selectbox("📊 Chart Type", ana.BIVARIATE_CHART_TYPES, key="biv_chart")
+            with bcc4: hue_col    = st.selectbox("🎨 Colour by", ["None"]+cat_cols, key="biv_hue"); hue_col = None if hue_col == "None" else hue_col
             st.markdown("</div>", unsafe_allow_html=True)
-
             with card(f"🔗 {x_col}  ×  {y_col}", chart_type):
-                if x_col == y_col:
-                    st.warning("X and Y columns are the same — please choose different columns.")
-                else:
-                    st.plotly_chart(ana.fig_bivariate(dff, x_col, y_col, chart_type, hue_col),
-                                    use_container_width=True)
-
+                if x_col == y_col: st.warning("X and Y columns are the same.")
+                else: st.plotly_chart(ana.fig_bivariate(dff, x_col, y_col, chart_type, hue_col), width='stretch', key="plotly_chart_8")
             if pd.api.types.is_numeric_dtype(dff[x_col]) and pd.api.types.is_numeric_dtype(dff[y_col]):
-                corr_val = dff[[x_col,y_col]].corr().iloc[0,1]
-                strength = "strong" if abs(corr_val)>.6 else "moderate" if abs(corr_val)>.3 else "weak"
-                direction= "positive" if corr_val>0 else "negative"
-                st.markdown(f"""<div style="font-size:.75rem;color:var(--txt2);margin-top:-.4rem;
-                    padding:.4rem .8rem;background:rgba(0,212,255,.04);border-radius:8px;
-                    border:1px solid rgba(0,212,255,.1)">
-                    📐 Pearson correlation: <strong style="color:{'#00E5A0' if abs(corr_val)>.3 else '#6A7D9C'}">
-                    {corr_val:.3f}</strong>&nbsp;—&nbsp; {strength} {direction} relationship</div>""",
-                    unsafe_allow_html=True)
-
+                corr_val = dff[[x_col, y_col]].corr().iloc[0, 1]
+                strength = "strong" if abs(corr_val) > .6 else "moderate" if abs(corr_val) > .3 else "weak"
+                direction = "positive" if corr_val > 0 else "negative"
+                st.markdown(f"""<div style="font-size:.75rem;color:var(--txt2);margin-top:-.4rem;padding:.4rem .8rem;background:rgba(0,212,255,.04);border-radius:8px;border:1px solid rgba(0,212,255,.1)">
+                    📐 Pearson correlation: <strong style="color:{'#00E5A0' if abs(corr_val)>.3 else '#6A7D9C'}">{corr_val:.3f}</strong> — {strength} {direction} relationship</div>""", unsafe_allow_html=True)
             if x_col != y_col:
-                bd = ana.get_bivariate_insights(dff, x_col, y_col, chart_type)
-                _insight_panel(bd["insights"], bd["recommendations"])
+                _insight_panel(*ana.get_bivariate_insights(dff, x_col, y_col, chart_type).values())
 
         with biv_tab2:
-            c1,c2 = st.columns(2, gap="medium")
+            c1, c2 = st.columns(2, gap="medium")
             with c1:
-                with card("💰 Income vs Conversion"):
-                    st.plotly_chart(ana.fig_income_vs_conversion(dff), use_container_width=True)
+                with card("💰 Income vs Conversion"): st.plotly_chart(ana.fig_income_vs_conversion(dff), width='stretch', key="plotly_chart_9")
             with c2:
-                with card("👶 Age Group vs Conversion"):
-                    st.plotly_chart(ana.fig_age_group_conversion(dff), use_container_width=True)
-            c3,c4 = st.columns(2, gap="medium")
+                with card("👶 Age Group vs Conversion"): st.plotly_chart(ana.fig_age_group_conversion(dff), width='stretch', key="plotly_chart_10")
+            c3, c4 = st.columns(2, gap="medium")
             with c3:
-                with card("⚧ Gender vs Conversion"):
-                    st.plotly_chart(ana.fig_gender_conversion(dff), use_container_width=True)
+                with card("⚧ Gender vs Conversion"): st.plotly_chart(ana.fig_gender_conversion(dff), width='stretch', key="plotly_chart_11")
             with c4:
-                with card("🏙 City Tier vs Conversion"):
-                    st.plotly_chart(ana.fig_city_tier_conversion(dff), use_container_width=True)
-            c5,c6 = st.columns(2, gap="medium")
+                with card("🏙 City Tier vs Conversion"): st.plotly_chart(ana.fig_city_tier_conversion(dff), width='stretch', key="plotly_chart_12")
+            c5, c6 = st.columns(2, gap="medium")
             with c5:
-                with card("🛂 Passport vs Conversion"):
-                    st.plotly_chart(ana.fig_passport_conversion(dff), use_container_width=True)
+                with card("🛂 Passport vs Conversion"): st.plotly_chart(ana.fig_passport_conversion(dff), width='stretch', key="plotly_chart_13")
             with c6:
-                with card("⭐ Pitch Satisfaction vs Conversion"):
-                    st.plotly_chart(ana.fig_pitch_satisfaction_conversion(dff), use_container_width=True)
-            with card("🔥 Correlation Matrix","Numeric"):
-                st.plotly_chart(ana.fig_correlation_heatmap(dff), use_container_width=True)
+                with card("⭐ Pitch Satisfaction vs Conversion"): st.plotly_chart(ana.fig_pitch_satisfaction_conversion(dff), width='stretch', key="plotly_chart_14")
+            with card("🔥 Correlation Matrix", "Numeric"):
+                st.plotly_chart(ana.fig_correlation_heatmap(dff), width='stretch', key="plotly_chart_15")
 
-    # ═══ INSIGHTS ═════════════════════════════════════════════════
+    # ═══ INSIGHTS ═══
     elif st.session_state.analysis_tab == "insights":
         stats = ana.compute_insight_stats(dff)
         st.markdown(f"""<div class="stat-counters">
@@ -514,10 +562,10 @@ elif st.session_state.page == "analysis":
           <div class="sc" style="--sc-bar:linear-gradient(90deg,#7B61FF,transparent)"><span class="sc-val" style="color:#7B61FF;-webkit-text-fill-color:#7B61FF">{stats['income_uplift']}×</span><span class="sc-lbl">Income Uplift</span></div>
           <div class="sc" style="--sc-bar:linear-gradient(90deg,#FFB547,transparent)"><span class="sc-val" style="color:#FFB547;-webkit-text-fill-color:#FFB547">{stats['top_age_segment']}</span><span class="sc-lbl">Top Age Segment</span></div>
         </div>""", unsafe_allow_html=True)
-        col_l,col_r = st.columns([1.1,1], gap="large")
+        col_l, col_r = st.columns([1.1, 1], gap="large")
         with col_l:
             st.markdown("""<p style="font-family:'Syne',sans-serif;font-size:.85rem;font-weight:700;color:#EEF2FF;margin-bottom:.7rem">💡 Key Findings</p>""", unsafe_allow_html=True)
-            for clr,bg,ico,ttl,body in [
+            for clr, bg, ico, ttl, body in [
                 ("#00D4FF","rgba(0,212,255,.08)","🎯","High-Value Age Bracket","Customers aged 26–35 show the highest conversion rates."),
                 ("#7B61FF","rgba(123,97,255,.08)","💰","Income Threshold Effect","A clear inflection at ₹35,000/month — purchase probability increases ~2.4×."),
                 ("#FF3CAC","rgba(255,60,172,.08)","⚧","Gender Dynamics","Female customers exhibit marginally higher conversion."),
@@ -527,7 +575,7 @@ elif st.session_state.page == "analysis":
                 st.markdown(f"""<div class="fin-card" style="--fc:{clr};--fc-bg:{bg}"><div class="fin-ico">{ico}</div><div><p class="fin-h">{ttl}</p><p class="fin-p">{body}</p></div></div>""", unsafe_allow_html=True)
         with col_r:
             st.markdown("""<p style="font-family:'Syne',sans-serif;font-size:.85rem;font-weight:700;color:#EEF2FF;margin-bottom:.7rem">🚀 Action Playbook</p>""", unsafe_allow_html=True)
-            for clr,bg,border,glow,q,ttl,items in [
+            for clr, bg, border, glow, q, ttl, items in [
                 ("#00D4FF","rgba(0,212,255,.09)","rgba(0,212,255,.18)","rgba(0,212,255,.1)","Q1","Segment &amp; Target",["Build income micro-segments","Launch email flows for 26–35","A/B test wellness vs adventure messaging"]),
                 ("#7B61FF","rgba(123,97,255,.09)","rgba(123,97,255,.2)","rgba(123,97,255,.1)","Q2","Channel Expansion",["Invest in Tier-2 digital","Referral incentives for passport holders","Partner with travel influencers"]),
                 ("#FF3CAC","rgba(255,60,172,.09)","rgba(255,60,172,.2)","rgba(255,60,172,.1)","Q3","Retention &amp; Upsell",["Loyalty tiers for repeat purchasers","Cross-sell premium packages","30-day post-purchase engagement"]),
@@ -536,546 +584,569 @@ elif st.session_state.page == "analysis":
                 st.markdown(f"""<div class="q-card" style="--qc:{clr};--qbg:{bg};--qborder:{border};--qglow:{glow}"><div class="q-header"><span class="q-badge">{q}</span><span class="q-title">{ttl}</span></div>{bullets}</div>""", unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════════════
-# PAGE 3 — PREDICTION  (3 tabs: Train All Models | Model Analysis | Predict)
+# PAGE 3 — PREDICTION  (4 tabs: Train | Tune | Analyse | Predict)
 # ══════════════════════════════════════════════════════════════════
 elif st.session_state.page == "prediction":
-    st.markdown("""<div class="pg-eye">✦ ML Prediction Engine</div>
+    st.markdown("""<div class="pg-eye">✦ 2-Stage ML Pipeline</div>
     <h1 class="pg-h1">Customer <span>Prediction</span></h1>
-    <p class="pg-sub">Train all models with automatic hyperparameter tuning, analyse results, run live predictions</p>
+    <p class="pg-sub">Stage 1: baseline multi-model training · Stage 2: single-model hyperparameter tuning · Analysis · Predict</p>
     <div class="pg-rule"></div>""", unsafe_allow_html=True)
 
-    pred_tab1, pred_tab2, pred_tab3, pred_tab4 = st.tabs(["🏋️ Train All Models","📊 Model Analysis","🔧 Hyperparameter Tuning","🎯 Predict"])
+    _base_done  = st.session_state.train_result is not None
+    _tuned_done = st.session_state.tune_result  is not None
+    _pipeline_strip(_base_done, _tuned_done)
 
-    # ══ TAB 1 — TRAIN ALL MODELS ════════════════════════════════
-    with pred_tab1:
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "🏋️ Train All Models",
+        "⚙️ Hyperparameter Tuning",
+        "📊 Model Analysis",
+        "🎯 Predict",
+    ])
+
+    # ══════════════════════════════════════════════════════════════
+    # TAB 1 — TRAIN ALL MODELS  (Stage 1: baseline only)
+    # ══════════════════════════════════════════════════════════════
+    with tab1:
         st.markdown("""<div style="background:rgba(0,212,255,.04);border:1px solid rgba(0,212,255,.15);
             border-radius:14px;padding:1rem 1.2rem;margin-bottom:1rem">
             <p style="font-family:'Syne',sans-serif;font-size:.88rem;font-weight:700;color:#00D4FF;margin:0 0 .4rem">
-            🔧 Training Pipeline</p>
-            <p style="font-size:.77rem;color:#8A9AB8;margin:0;line-height:1.6">
-            Trains <strong style="color:#EEF2FF">all models</strong> with optional
-            <strong style="color:#00D4FF">RandomizedSearchCV</strong> hyperparameter tuning.
-            Before training, applies <strong style="color:#00E5A0">BorderlineSMOTE + Tomek Links</strong>
-            to correct the 4.31:1 class imbalance. Best model &amp; all artefacts are
-            <strong style="color:#FFB547">automatically saved</strong> — metrics load instantly on return.</p>
+            🔧 Stage 1 — Baseline Training Pipeline</p>
+            <p style="font-size:.77rem;color:#8A9AB8;margin:0;line-height:1.7">
+            Trains <strong style="color:#EEF2FF">all models with default (baseline) parameters</strong> — no tuning yet.
+            Applies <strong style="color:#00E5A0">BorderlineSMOTE + Tomek Links</strong> to fix the 4.31:1 class imbalance.
+            CV scores are computed leakage-safe (balancing inside each fold). Produces a leaderboard and
+            <strong style="color:#FFB547">identifies the best base learner</strong> by F1 score.<br>
+            <strong style="color:#FF3CAC">↳ Hyperparameter Tuning (Tab 2) will then tune only that winner.</strong></p>
         </div>""", unsafe_allow_html=True)
 
-        ctrl1, ctrl2, ctrl3 = st.columns([1, 1, 2])
-        with ctrl1:
-            use_tuning = st.radio("Hyperparameter Tuning", ["With Tuning", "Without Tuning"],
-                                  horizontal=False, key="use_tuning")
-            do_tune = use_tuning == "With Tuning"
-        with ctrl2:
-            tune_iters = st.slider("Search iterations", 5, 40, 15, 5,
-                                   disabled=not do_tune, key="tune_iters_slider")
-        with ctrl3:
-            mode_note = (
-                f"⚡ <strong style='color:#7B61FF'>RandomizedSearchCV</strong> — {tune_iters} iters/model, StratifiedKFold (k=5), F1 scoring."
-                if do_tune else
-                "🚀 <strong style='color:#00E5A0'>Default params</strong> — trains fast with no search. Good for a quick baseline."
-            )
-            st.markdown(f"""<div style="font-size:.75rem;color:var(--txt2);padding:.55rem .9rem;
-                background:rgba(123,97,255,.04);border:1px solid rgba(123,97,255,.15);
-                border-radius:8px;margin-top:.3rem;line-height:1.65">
-                {mode_note}<br>
-                Models: Logistic Regression, Decision Tree, Random Forest, Gradient Boosting, AdaBoost
-                {'+ XGBoost' if pred.HAS_XGB else ''}
-            </div>""", unsafe_allow_html=True)
+        # Models info row
+        n_models = 5 + (1 if pred.HAS_XGB else 0)
+        _model_names = (["Logistic Regression", "Decision Tree", "Random Forest",
+                          "Gradient Boosting", "AdaBoost"] + (["XGBoost"] if pred.HAS_XGB else []))
+        _model_pills = "".join(
+            '<span style="font-size:.72rem;background:rgba(0,212,255,.07);border:1px solid '
+            'rgba(0,212,255,.15);padding:.2rem .55rem;border-radius:99px;color:#8A9AB8">'
+            '<strong style="color:#EEF2FF">' + m + '</strong></span>'
+            for m in _model_names
+        )
+        st.markdown(
+            '<div style="display:flex;gap:.6rem;flex-wrap:wrap;margin-bottom:1rem">'
+            + _model_pills
+            + '<span style="font-size:.72rem;background:rgba(0,229,160,.07);border:1px solid '
+            'rgba(0,229,160,.15);padding:.2rem .55rem;border-radius:99px;color:#00E5A0">'
+            + str(n_models) + ' models · default params · balanced training</span></div>',
+            unsafe_allow_html=True
+        )
 
-        btn_label = "🚀 Train All Models (Balancing + Tuning)" if do_tune else "🚀 Train All Models (Balancing, No Tuning)"
-        if st.button(btn_label, use_container_width=True, type="primary"):
+        if st.button("🚀 Train All Models  (Baseline — No Tuning)", width='stretch', type="primary"):
             prog_bar  = st.progress(0)
             prog_text = st.empty()
-            steps     = ["Logistic Regression","Decision Tree","Random Forest",
-                         "Gradient Boosting","AdaBoost"] + (["XGBoost"] if pred.HAS_XGB else [])
+            steps = (["Logistic Regression","Decision Tree","Random Forest","Gradient Boosting","AdaBoost"]
+                     + (["XGBoost"] if pred.HAS_XGB else []))
             step_count = [0]
             def _prog_cb(name):
                 step_count[0] += 1
-                prog_bar.progress(min(step_count[0]/len(steps), 0.95))
-                prog_text.markdown(f"<span style='color:var(--txt2);font-size:.8rem'>"
-                                   f"🔄 {'Tuning' if do_tune else 'Training'} {name}…</span>", unsafe_allow_html=True)
-            with st.spinner("Balancing + training in progress…"):
+                prog_bar.progress(min(step_count[0] / len(steps), 0.95))
+                prog_text.markdown(f"<span style='color:var(--txt2);font-size:.8rem'>🔄 Training {name} (baseline)…</span>", unsafe_allow_html=True)
+
+            with st.spinner("Balancing + baseline training…"):
                 try:
-                    result = pred.train_all_models(
-                        ana.load_cleaned(),
-                        tune_iters=tune_iters if do_tune else 0,
-                        progress_cb=_prog_cb)
-                    pred.save_artefacts(result)
+                    result = pred.train_all_models(ana.load_cleaned(), progress_cb=_prog_cb)
+                    pred.save_base_artefacts(result)
                     st.session_state.train_result = result
-                    st.session_state.model        = result["best_model"]
-                    st.session_state.model_name   = result["best_name"]
+                    # Clear any stale tuning result if model winner changed
+                    if (st.session_state.tune_result and
+                            st.session_state.tune_result.get("best_name") != result["best_name"]):
+                        st.session_state.tune_result = None
                     prog_bar.progress(1.0); prog_text.empty()
                     best_row = result["results_df"].iloc[0]
-                    st.success(f"✅ Done!  Best model: **{result['best_name']}**  |  "
-                               f"F1: {best_row['F1']}  |  ROC-AUC: {best_row['ROC-AUC']}  |  "
-                               f"PR-AUC: {best_row['PR-AUC']}")
-                    st.info(f"💾 Saved to disk — metrics will load automatically next time.")
+                    st.success(
+                        f"✅ Stage 1 complete!  Best base learner: **{result['best_name']}**  |  "
+                        f"F1: {best_row['F1']}  |  ROC-AUC: {best_row['ROC-AUC']}  |  PR-AUC: {best_row['PR-AUC']}"
+                    )
+                    st.info("💾 Saved to disk. Go to **Hyperparameter Tuning** tab to tune the winner.")
                 except Exception as e:
                     prog_bar.empty(); prog_text.empty()
                     st.error(f"Training failed: {e}")
 
-        # ── Auto-load from disk if no in-memory result ──
-        if st.session_state.train_result is None and pred.artefacts_exist():
-            _arts = pred.load_artefacts()
-            if _arts:
-                # Reconstruct a minimal train_result from saved meta
-                _meta = _arts["meta"]
-                st.session_state.train_result = {
-                    "best_model"    : _arts["model"],
-                    "best_name"     : _meta["best_name"],
-                    "models"        : {_meta["best_name"]: _arts["model"]},
-                    "results_df"    : _meta["results_df"],
-                    "scaler"        : _arts["scaler"],
-                    "le_dict"       : _arts["le_dict"],
-                    "feature_names" : _meta["feature_names"],
-                    "X_test"        : _meta["X_test"],
-                    "X_test_sc"     : _meta["X_test_sc"],
-                    "best_X_test"   : _meta["best_X_test"],
-                    "y_test"        : _meta["y_test"],
-                    "balance_method": _meta["balance_method"],
-                    "before_balance": _meta["before_balance"],
-                    "after_balance" : _meta["after_balance"],
-                    "tuned"         : True,
-                    "tuning_log"    : _meta.get("tuning_log", {}),
-                    "best_search_space"    : _meta.get("best_search_space", {}),
-                    "best_model_comparison": _meta.get("best_model_comparison", {}),
-                }
-                st.info("📂 Loaded saved training results from disk — no need to retrain.")
-
+        # ── Results ──
         if st.session_state.train_result:
             res = st.session_state.train_result
+            best_name  = res["best_name"]
+            results_df = res["results_df"]
+
             st.markdown("---")
-            # Balancing summary
-            bef = res.get("before_balance", {})
-            aft = res.get("after_balance",  {})
-            bm  = res.get("balance_method", "N/A")
-            c_bal1, c_bal2 = st.columns([1,1], gap="medium")
+
+            # Best model banner
+            best_row = results_df.iloc[0]
+            _banner_metrics = "".join(
+                '<div style="text-align:center">'
+                '<div style="font-family:\'Syne\',sans-serif;font-size:1.1rem;font-weight:800;color:#00D4FF">'
+                + str(best_row.get(m, "—")) +
+                '</div><div style="font-size:.65rem;color:#6A7D9C;text-transform:uppercase;letter-spacing:.08em">'
+                + m + '</div></div>'
+                for m in ["F1", "ROC-AUC", "PR-AUC", "Balanced Accuracy"]
+            )
+            st.markdown(
+                '<div style="background:linear-gradient(135deg,rgba(0,229,160,.07),rgba(0,212,255,.05));'
+                'border:1px solid rgba(0,229,160,.25);border-left:4px solid #00E5A0;border-radius:14px;'
+                'padding:.9rem 1.2rem;margin-bottom:1rem;display:flex;align-items:center;gap:1rem;flex-wrap:wrap">'
+                '<div>'
+                '<div style="font-family:\'Syne\',sans-serif;font-size:.78rem;font-weight:700;color:#00E5A0;margin-bottom:.2rem">'
+                '🏆 Best Base Learner — ready for Stage 2 tuning</div>'
+                '<div style="font-family:\'Syne\',sans-serif;font-size:1.3rem;font-weight:800;color:#EEF2FF">'
+                + best_name +
+                '</div></div>'
+                '<div style="display:flex;gap:1rem;margin-left:auto;flex-wrap:wrap">'
+                + _banner_metrics +
+                '</div></div>',
+                unsafe_allow_html=True
+            )
+
+            # Balancing results
+            bef = res.get("before_balance", {}); aft = res.get("after_balance", {}); bm = res.get("balance_method", "N/A")
+            c_bal1, c_bal2 = st.columns([1, 1], gap="medium")
             with c_bal1:
                 with card("⚖️ Class Balancing Results", bm):
-                    st.plotly_chart(pred.fig_balance_pie(bef, aft, bm), use_container_width=True,
-                                    key="balance_pie_train")
+                    st.plotly_chart(pred.fig_balance_pie(bef, aft, bm), width='stretch', key="balance_pie_train")
             with c_bal2:
-                st.markdown(f"""<div style="background:rgba(0,229,160,.04);border:1px solid
-                    rgba(0,229,160,.15);border-left:3px solid #00E5A0;border-radius:14px;
-                    padding:1rem 1.1rem;margin-top:.85rem">
-                    <p style="font-family:'Syne',sans-serif;font-size:.82rem;font-weight:700;
-                    color:#00E5A0;margin:0 0 .6rem">🧪 Balancing Details</p>
+                st.markdown(f"""<div style="background:rgba(0,229,160,.04);border:1px solid rgba(0,229,160,.15);border-left:3px solid #00E5A0;border-radius:14px;padding:1rem 1.1rem;margin-top:.85rem">
+                    <p style="font-family:'Syne',sans-serif;font-size:.82rem;font-weight:700;color:#00E5A0;margin:0 0 .6rem">🧪 Balancing Details</p>
                     <div style="font-size:.76rem;color:#8A9AB8;line-height:1.75">
                     <div><span style="color:#6A7D9C">Method:</span>&nbsp;<strong style="color:#00D4FF">{bm}</strong></div>
-                    <div><span style="color:#6A7D9C">Before:</span>&nbsp;
-                      <span style="color:#FF3CAC">Class 0 = {bef.get(0,'?')}</span>&nbsp;/&nbsp;
-                      <span style="color:#00E5A0">Class 1 = {bef.get(1,'?')}</span></div>
-                    <div><span style="color:#6A7D9C">After:</span>&nbsp;
-                      <span style="color:#FF3CAC">Class 0 = {aft.get(0,'?')}</span>&nbsp;/&nbsp;
-                      <span style="color:#00E5A0">Class 1 = {aft.get(1,'?')}</span></div>
-                    <div style="margin-top:.5rem;padding:.5rem .7rem;background:rgba(0,212,255,.05);
-                      border-radius:8px;font-size:.73rem;color:#6A7D9C;line-height:1.6">
-                    {pred.BALANCE_RATIONALE}</div>
-                    </div></div>""", unsafe_allow_html=True)
+                    <div><span style="color:#6A7D9C">Before:</span>&nbsp;<span style="color:#FF3CAC">Class 0 = {bef.get(0,"?")}</span>&nbsp;/&nbsp;<span style="color:#00E5A0">Class 1 = {bef.get(1,"?")}</span></div>
+                    <div><span style="color:#6A7D9C">After:</span>&nbsp;<span style="color:#FF3CAC">Class 0 = {aft.get(0,"?")}</span>&nbsp;/&nbsp;<span style="color:#00E5A0">Class 1 = {aft.get(1,"?")}</span></div>
+                    </div>
+                    <div style="margin-top:.5rem;font-size:.73rem;color:#6A7D9C;line-height:1.6">{pred.BALANCE_RATIONALE}</div>
+                </div>""", unsafe_allow_html=True)
 
             # Leaderboard
-            with card("📊 Model Leaderboard", "All Metrics"):
-                display_cols = [c for c in ["Model","F1","ROC-AUC","PR-AUC","Accuracy",
-                                            "Balanced Accuracy","Precision","Recall",
-                                            "MCC","Cohen Kappa","Log Loss","Brier Score",
-                                            "CV ROC-AUC","CV Std"] if c in res["results_df"].columns]
-                styled = res["results_df"][display_cols].style.highlight_max(
-                    subset=[c for c in ["F1","ROC-AUC","PR-AUC","Accuracy","Balanced Accuracy",
-                                        "Precision","Recall","MCC","Cohen Kappa","CV ROC-AUC"]
-                            if c in display_cols],
+            with card("📊 Baseline Model Leaderboard", "Ranked by F1"):
+                display_cols = [c for c in ["Model","F1","ROC-AUC","PR-AUC","Accuracy","Balanced Accuracy",
+                                            "Precision","Recall","MCC","Cohen Kappa","Log Loss","Brier Score",
+                                            "CV ROC-AUC","CV Std"] if c in results_df.columns]
+                styled = results_df[display_cols].style.highlight_max(
+                    subset=[c for c in ["F1","ROC-AUC","PR-AUC","Accuracy","Balanced Accuracy","Precision","Recall","MCC","Cohen Kappa","CV ROC-AUC"] if c in display_cols],
                     color="rgba(0,229,160,.18)"
                 ).highlight_min(
                     subset=[c for c in ["Log Loss","Brier Score","CV Std"] if c in display_cols],
                     color="rgba(0,229,160,.18)")
-                st.dataframe(styled, use_container_width=True, height=260)
+                st.dataframe(styled, width='stretch', height=260)
+
+            # Comparison chart
+            with card("📊 Baseline Model Comparison"):
+                st.plotly_chart(pred.fig_model_comparison(results_df), width='stretch', key="plotly_chart_16")
 
             with st.expander("📖 Which metric should I trust?", expanded=False):
                 st.markdown(pred.BEST_METRIC_NOTE)
                 m_cols = st.columns(4)
-                for i,(k,(ico,clr,desc)) in enumerate(pred.METRIC_INFO.items()):
+                for i, (k, (ico, clr, desc)) in enumerate(pred.METRIC_INFO.items()):
                     best_tag = '<span class="best-badge">★ BEST</span>' if k in ("F1","PR-AUC") else ""
-                    with m_cols[i%4]:
+                    with m_cols[i % 4]:
                         st.markdown(f"""<div class="metric-card" style="--mc:{clr}">
                         <div class="metric-card-icon">{ico}</div>
                         <span class="metric-card-label">{k}{best_tag}</span>
                         <span class="metric-card-desc">{desc}</span></div>""", unsafe_allow_html=True)
 
-    # ══ TAB 2 — MODEL ANALYSIS ══════════════════════════════════
-    with pred_tab2:
-        # Load from session or from disk
-        _res  = st.session_state.train_result
-        _arts = None
-        if _res is None and pred.artefacts_exist():
-            _arts = pred.load_artefacts()
+            # Artefact status
+            st.markdown("---")
+            st.markdown("""<p style="font-family:'Syne',sans-serif;font-size:.82rem;font-weight:700;color:var(--txt1);margin-bottom:.5rem">📁 Saved Artefacts</p>""", unsafe_allow_html=True)
+            art_cols = st.columns(5)
+            for ac, fname, desc in zip(art_cols,
+                ["base_model.pkl","scaler.pkl","feature_names.pkl","label_encoders.pkl","base_meta.pkl"],
+                ["Best baseline model","StandardScaler","Feature column list","LabelEncoders","Stage-1 metadata"]):
+                with ac:
+                    exists = pred.base_artefacts_exist()
+                    clr = "#00E5A0" if exists else "#FF3CAC"
+                    ico = "✅" if exists else "❌"
+                    st.markdown(f"""<div style="background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.08);border-radius:10px;padding:.6rem .7rem;text-align:center">
+                        <div style="font-size:1.1rem">{ico}</div>
+                        <div style="font-size:.68rem;font-weight:700;color:{clr};margin:.2rem 0">{fname}</div>
+                        <div style="font-size:.62rem;color:#4A5A6E">{desc}</div>
+                    </div>""", unsafe_allow_html=True)
 
-        if _res is None and _arts is None:
-            st.markdown("""<div style="text-align:center;padding:3rem 1rem;color:var(--txt2)">
-              <div style="font-size:3rem;margin-bottom:.8rem">🔒</div>
-              <div style="font-family:'Syne',sans-serif;font-size:.95rem;font-weight:700;
-                color:var(--txt1);margin-bottom:.4rem">No Trained Model Found</div>
-              <div style="font-size:.82rem">Go to <strong>Train All Models</strong> tab to train and save a model first.</div>
-            </div>""", unsafe_allow_html=True)
+    # ══════════════════════════════════════════════════════════════
+    # TAB 2 — HYPERPARAMETER TUNING  (Stage 2: tune the winner)
+    # ══════════════════════════════════════════════════════════════
+    with tab2:
+        if not _base_done:
+            _locked_state("⚙️", "Run Stage 1 First",
+                          "Go to <strong>Train All Models</strong> tab to train and identify the best base learner before tuning.")
         else:
-            # Get model and test data
-            if _res:
-                best_model  = _res["best_model"]
-                best_name   = _res["best_name"]
-                results_df  = _res["results_df"]
-                y_test      = _res["y_test"]
-                X_test      = _res["X_test"]
-                X_test_sc   = _res["X_test_sc"]
-                best_X_test = _res["best_X_test"]
-                bef         = _res.get("before_balance",{})
-                aft         = _res.get("after_balance",{})
-                bm          = _res.get("balance_method","N/A")
-                feat_names  = _res["feature_names"]
-                models_dict = _res["models"]
-            else:
-                meta        = _arts["meta"]
-                best_model  = _arts["model"]
-                best_name   = meta["best_name"]
-                results_df  = meta["results_df"]
-                y_test      = meta["y_test"]
-                X_test      = meta["X_test"]
-                X_test_sc   = meta["X_test_sc"]
-                best_X_test = meta.get("best_X_test", X_test)
-                bef         = meta.get("before_balance",{})
-                aft         = meta.get("after_balance",{})
-                bm          = meta.get("balance_method","N/A")
-                feat_names  = meta["feature_names"]
-                models_dict = {best_name: best_model}
+            _base_res   = st.session_state.train_result
+            best_name   = _base_res["best_name"]
+            base_row    = _base_res["results_df"].iloc[0].to_dict()
 
-            st.markdown(f"""<div class="active-tab-bar">🏆 Best Model: {best_name}</div>""",
+            st.markdown(f"""<div class="active-tab-bar">⚙️ Stage 2 — Tuning: {best_name}
+                <span class="base-badge">STAGE 1 WINNER</span></div>""", unsafe_allow_html=True)
+
+            # Explainer + controls
+            c_info, c_ctrl = st.columns([1.4, 1], gap="medium")
+            with c_info:
+                st.markdown(f"""<div style="background:rgba(123,97,255,.05);border:1px solid rgba(123,97,255,.16);border-radius:14px;padding:1rem 1.1rem;margin-bottom:1rem">
+                    <p style="font-family:'Syne',sans-serif;font-size:.84rem;font-weight:700;color:#7B61FF;margin:0 0 .5rem">🎯 What happens here?</p>
+                    <div style="font-size:.76rem;color:#8A9AB8;line-height:1.7">
+                    <strong style="color:#EEF2FF">Only {best_name}</strong> is tuned — the Stage-1 winner.
+                    <code>RandomizedSearchCV</code> with <strong>StratifiedKFold (k=5)</strong> searches for
+                    better hyperparameters using <strong>F1 scoring</strong>. BorderlineSMOTE + Tomek Links
+                    runs <em>inside each CV fold</em> to prevent data leakage. The best configuration is then
+                    refit on the full balanced training set and evaluated on the same held-out test set.
+                    </div></div>""", unsafe_allow_html=True)
+            with c_ctrl:
+                tune_iters = st.slider("🔍 Search iterations (RandomizedSearchCV)", 10, 50, 25, 5, key="tune_iters_v2")
+                st.markdown(f"""<div style="font-size:.73rem;color:#6A7D9C;line-height:1.6;margin-top:.4rem;padding:.5rem .75rem;background:rgba(123,97,255,.04);border:1px solid rgba(123,97,255,.14);border-radius:8px">
+                  {tune_iters} candidate configs × 5 CV folds = <strong style="color:#EEF2FF">{tune_iters*5} fits</strong><br>
+                  Scoring: <strong style="color:#7B61FF">F1</strong> · n_jobs=-1 (parallel)
+                </div>""", unsafe_allow_html=True)
+
+            # Base model stats
+            st.markdown(f"""<div class="model-info-card">
+              <p class="model-info-h">📊 {best_name} — Baseline Metrics (pre-tuning)</p>
+              {"".join(f'<div class="model-info-row"><span class="model-info-k">{k}</span><span class="model-info-v">{base_row.get(k,"—")}</span></div>' for k in ["F1","ROC-AUC","PR-AUC","Balanced Accuracy","Recall","Precision"])}
+            </div>""", unsafe_allow_html=True)
+
+            if st.button(f"⚙️ Tune {best_name}", width='stretch', type="primary"):
+                if _base_res.get("X_train_raw") is None:
+                    st.error("⚠️ Training data not available. Please re-run **Train All Models** with the updated prediction.py to store train data in memory.")
+                else:
+                    tune_prog = st.empty()
+                    def _tune_cb(msg):
+                        tune_prog.markdown(f"<span style='color:var(--txt2);font-size:.8rem'>🔄 {msg}</span>", unsafe_allow_html=True)
+                    with st.spinner(f"Tuning {best_name} — this may take a moment…"):
+                        try:
+                            tune_res = pred.tune_best_model(_base_res, tune_iters=tune_iters, progress_cb=_tune_cb)
+                            pred.save_tuned_artefacts(tune_res)
+                            st.session_state.tune_result = tune_res
+                            tune_prog.empty()
+                            tm = tune_res["tuned_metrics"]
+                            st.success(
+                                f"✅ Stage 2 complete! Tuned {best_name}  |  "
+                                f"F1: {tm.get('F1','—')}  |  Recall: {tm.get('Recall','—')}  |  ROC-AUC: {tm.get('ROC-AUC','—')}"
+                            )
+                        except Exception as e:
+                            tune_prog.empty()
+                            st.error(f"Tuning failed: {e}")
+
+            # ── Tuning results ──
+            _tun = st.session_state.tune_result
+            if _tun and _tun.get("best_name") == best_name:
+                st.markdown("---")
+                search_space = _tun.get("tuning_search_space", {})
+                comparison   = _tun.get("comparison", {})
+                best_params  = _tun.get("best_params", {})
+                best_cv_f1   = _tun.get("best_cv_f1")
+
+                # Best params table
+                if best_params:
+                    c_p1, c_p2 = st.columns([1, 1.5], gap="medium")
+                    with c_p1:
+                        with card(f"🎛 Best Hyperparameters — {best_name}", "Tuned"):
+                            params_df = pd.DataFrame([{"Parameter": k, "Best Value": str(v)} for k, v in best_params.items()])
+                            st.dataframe(params_df, width='stretch', hide_index=True)
+                            if isinstance(best_cv_f1, float):
+                                st.markdown(f"""<div style="margin-top:.5rem;padding:.5rem .75rem;background:rgba(0,229,160,.06);border:1px solid rgba(0,229,160,.2);border-radius:8px;font-size:.77rem;color:#00E5A0;font-weight:600">
+                                  🏆 Best CV F1 (during search): <strong>{best_cv_f1:.4f}</strong></div>""", unsafe_allow_html=True)
+                    with c_p2:
+                        if search_space:
+                            with card("📊 Best Parameter Profile"):
+                                st.plotly_chart(pred.fig_best_params_bar(search_space, best_name), width='stretch', key="plotly_chart_17")
+
+                # Search space heatmap
+                if search_space:
+                    with card("🗺 Search Space Heatmap", "★ = selected"):
+                        st.plotly_chart(pred.fig_tuning_search_space(search_space, best_name), width='stretch', key="plotly_chart_18")
+
+                # Comparison charts
+                if comparison:
+                    c_cmp1, c_cmp2 = st.columns(2, gap="medium")
+                    with c_cmp1:
+                        with card("📈 Baseline vs Tuned"):
+                            st.plotly_chart(pred.fig_tuning_comparison(comparison, best_name), width='stretch', key="plotly_chart_19")
+                    with c_cmp2:
+                        with card("📉 Metric Delta (Tuned − Baseline)"):
+                            st.plotly_chart(pred.fig_tuning_delta(comparison, best_name), width='stretch', key="plotly_chart_20")
+
+                    with st.expander("📋 Tuning Comparison Table", expanded=False):
+                        st.dataframe(pred.get_tuning_comparison(comparison), width='stretch', hide_index=True)
+
+                # Tuned artefacts status
+                st.markdown("---")
+                st.markdown("""<p style="font-family:'Syne',sans-serif;font-size:.82rem;font-weight:700;color:var(--txt1);margin-bottom:.5rem">📁 Tuned Artefacts</p>""", unsafe_allow_html=True)
+                art_cols2 = st.columns(3)
+                for ac, fname, desc in zip(art_cols2,
+                    ["tuned_model.pkl","tuned_meta.pkl","(scaler/encoders shared)"],
+                    ["Tuned model object","Stage-2 metadata + params","Re-used from Stage 1"]):
+                    with ac:
+                        exists = pred.tuned_artefacts_exist() if "tuned_meta" in fname or "tuned_model" in fname else True
+                        clr = "#00E5A0" if exists else "#FF3CAC"
+                        ico = "✅" if exists else "❌"
+                        st.markdown(f"""<div style="background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.08);border-radius:10px;padding:.6rem .7rem;text-align:center">
+                            <div style="font-size:1.1rem">{ico}</div>
+                            <div style="font-size:.68rem;font-weight:700;color:{clr};margin:.2rem 0">{fname}</div>
+                            <div style="font-size:.62rem;color:#4A5A6E">{desc}</div>
+                        </div>""", unsafe_allow_html=True)
+            elif not _tun:
+                st.info("Run the tuner above to see results. The tuned model will automatically be used for Model Analysis and Predict.")
+
+    # ══════════════════════════════════════════════════════════════
+    # TAB 3 — MODEL ANALYSIS  (active = tuned > base)
+    # ══════════════════════════════════════════════════════════════
+    with tab3:
+        if not _base_done:
+            _locked_state("🔒", "No Trained Model Found",
+                          "Go to <strong>Train All Models</strong> tab to train a model first.")
+        else:
+            # Prefer tuned model; fall back to base winner
+            _tun = st.session_state.tune_result
+            _bas = st.session_state.train_result
+
+            if _tun:
+                analysis_model   = _tun["tuned_model"]
+                analysis_name    = _tun["best_name"]
+                analysis_Xtest   = _tun["best_X_test"]
+                analysis_ytest   = _tun["y_test"]
+                analysis_feats   = _tun["feature_names"]
+                analysis_row     = _tun["tuned_metrics"]
+                analysis_Xtest_r = _tun["X_test"]
+                analysis_Xtsc    = _tun["X_test_sc"]
+                analysis_bef     = _tun["before_balance"]
+                analysis_aft     = _tun["after_balance"]
+                analysis_bm      = _tun["balance_method"]
+                stage_label      = f"<span class='tuned-badge'>TUNED ✓</span>"
+                models_dict      = {analysis_name: analysis_model}
+                results_df_src   = _bas["results_df"]   # leaderboard still from baseline
+            else:
+                analysis_model   = _bas["best_model"]
+                analysis_name    = _bas["best_name"]
+                analysis_Xtest   = _bas["best_X_test"]
+                analysis_ytest   = _bas["y_test"]
+                analysis_feats   = _bas["feature_names"]
+                analysis_row     = _bas["results_df"].iloc[0].to_dict()
+                analysis_Xtest_r = _bas["X_test"]
+                analysis_Xtsc    = _bas["X_test_sc"]
+                analysis_bef     = _bas.get("before_balance", {})
+                analysis_aft     = _bas.get("after_balance",  {})
+                analysis_bm      = _bas.get("balance_method", "N/A")
+                stage_label      = "<span class='base-badge'>BASELINE</span>"
+                models_dict      = _bas.get("models", {analysis_name: analysis_model})
+                results_df_src   = _bas["results_df"]
+
+            st.markdown(f"""<div class="active-tab-bar">📊 Analysing: {analysis_name} {stage_label}</div>""",
                         unsafe_allow_html=True)
 
-            # ── Best model info card ──
-            best_row = results_df[results_df["Model"]==best_name].iloc[0].to_dict()
+            if not _tun:
+                st.info("💡 Tip: Run **Hyperparameter Tuning** (Tab 2) to analyse the tuned production model instead of the baseline.")
 
-            # Build tuning params block (only for XGBoost, from tuning_log or static fallback)
-            _tuning_log = {}
-            if st.session_state.train_result and st.session_state.train_result.get("tuning_log"):
-                _tuning_log = st.session_state.train_result["tuning_log"]
-            elif _arts and _arts.get("meta", {}).get("tuning_log"):
-                _tuning_log = _arts["meta"]["tuning_log"]
-
-            _best_params = _tuning_log.get(best_name, {}).get("best_params", {})
-            _cv_f1       = _tuning_log.get(best_name, {}).get("best_cv_f1", None)
-
-            # Fallback: if XGBoost and no tuning log yet, show known best params
-            if not _best_params and "XGBoost" in best_name:
-                _best_params = {
-                    "n_estimators": 500, "learning_rate": 0.05, "max_depth": 5,
-                    "min_child_weight": 3, "subsample": 0.8, "colsample_bytree": 0.7,
-                    "gamma": 0.1, "reg_alpha": 0.3, "reg_lambda": 1.5,
-                    "scale_pos_weight": 4.31,
-                }
-
-            # Recall gain note (shown only for XGBoost)
-            _recall_note = ""
-            if "XGBoost" in best_name:
-                _recall_note = (
-                    '<div style="margin-top:.75rem;padding:.55rem .75rem;background:rgba(0,229,160,.06);border:1px solid rgba(0,229,160,.18);border-radius:8px;font-size:.72rem;line-height:1.65;color:#8A9AB8">'
-                    '⚠️ <strong style="color:#EEF2FF">Pipeline context:</strong> '
-                    'These metrics are measured <strong style="color:#00E5A0">after BorderlineSMOTE + Tomek Links</strong> '
-                    'resampling (4.31:1 → balanced training set). Raw pre-SMOTE metrics would be lower.<br>'
-                    '<span style="color:#00E5A0">★ Key tuning gain:</span> '
-                    '<code style="background:rgba(0,229,160,.1);padding:.05rem .3rem;border-radius:4px">scale_pos_weight=4.31</code> '
-                    'boosted <strong>Recall by +12%</strong> (0.66 → 0.78) vs baseline — the correct trade-off for a marketing use-case '
-                    'where <em>missing a buyer costs more than a false positive</em>.'
-                    '</div>'
-                )
-
-            st.markdown(f"""<div class="model-info-card">
-              <p class="model-info-h">🏆 {best_name} — Selected Best Model</p>
-              {''.join(f'<div class="model-info-row"><span class="model-info-k">{k}</span><span class="model-info-v">{best_row.get(k,"—")}</span></div>' for k in ["F1","ROC-AUC","PR-AUC","Balanced Accuracy","MCC","Accuracy"])}
-              {_recall_note}
-            </div>""", unsafe_allow_html=True)
-
-            # ── Class distribution pie (after balancing) ──
-            with card("⚖️ ProdTaken — Class Distribution Before vs After Balancing", bm):
-                st.plotly_chart(pred.fig_balance_pie(bef, aft, bm), use_container_width=True,key="balance_pie_analysis")
-            st.markdown(f"""<div style="font-size:.77rem;color:#8A9AB8;padding:.6rem .9rem;
-                background:rgba(0,229,160,.04);border:1px solid rgba(0,229,160,.12);
-                border-radius:10px;margin-bottom:1rem;line-height:1.7">
-                {pred.BALANCE_RATIONALE}</div>""", unsafe_allow_html=True)
-
-            # ── Metric cards ──
+            # Metric cards
             primary_m = ["Accuracy","Balanced Accuracy","Precision","Recall","F1","ROC-AUC","PR-AUC","MCC"]
             mc = st.columns(4)
-            for i,k in enumerate(primary_m):
-                v = best_row.get(k)
+            for i, k in enumerate(primary_m):
+                v = analysis_row.get(k)
                 if v is None: continue
-                ico,clr,desc = pred.METRIC_INFO.get(k,("📊","#00D4FF",""))
+                ico, clr, desc = pred.METRIC_INFO.get(k, ("📊","#00D4FF",""))
                 best_tag = '<span class="best-badge">★ BEST</span>' if k in ("F1","PR-AUC") else ""
-                with mc[i%4]:
+                with mc[i % 4]:
                     st.markdown(f"""<div class="metric-card" style="--mc:{clr}">
                     <div class="metric-card-icon">{ico}</div>
                     <span class="metric-card-val" style="color:{clr};-webkit-text-fill-color:{clr}">{v}</span>
                     <span class="metric-card-label">{k}{best_tag}</span>
                     <span class="metric-card-desc">{desc}</span></div>""", unsafe_allow_html=True)
 
-            # ── Charts ──
-            c1,c2 = st.columns(2, gap="medium")
+            # Class balancing chart
+            with card(f"⚖️ Class Distribution Before vs After Balancing", analysis_bm):
+                st.plotly_chart(pred.fig_balance_pie(analysis_bef, analysis_aft, analysis_bm),
+                                width='stretch', key="balance_pie_analysis")
+
+            # Main charts
+            c1, c2 = st.columns(2, gap="medium")
             with c1:
-                with card("📈 Model Comparison"):
-                    st.plotly_chart(pred.fig_model_comparison(results_df), use_container_width=True)
+                with card("📈 Baseline Model Comparison"):
+                    st.plotly_chart(pred.fig_model_comparison(results_df_src), width='stretch', key="plotly_chart_22")
             with c2:
-                with card("📉 ROC Curves"):
-                    st.plotly_chart(pred.fig_roc_curves(models_dict, X_test, y_test, X_test_sc),
-                                    use_container_width=True)
-            c3,c4 = st.columns(2, gap="medium")
+                with card("📉 ROC Curves (all baseline models)"):
+                    st.plotly_chart(pred.fig_roc_curves(models_dict, analysis_Xtest_r, analysis_ytest, analysis_Xtsc),
+                                    width='stretch', key="roc_curves_analysis")
+            c3, c4 = st.columns(2, gap="medium")
             with c3:
-                with card(f"🧮 Confusion Matrix — {best_name}"):
-                    st.plotly_chart(pred.fig_confusion_matrix(best_model, best_X_test, y_test, best_name),
-                                    use_container_width=True)
+                with card(f"🧮 Confusion Matrix — {analysis_name} {stage_label if _tun else ''}"):
+                    st.plotly_chart(pred.fig_confusion_matrix(analysis_model, analysis_Xtest, analysis_ytest, analysis_name),
+                                    width='stretch', key="confusion_matrix_analysis")
             with c4:
-                with card(f"📉 Precision-Recall Curve — {best_name}"):
-                    st.plotly_chart(pred.fig_pr_curve(best_model, best_X_test, y_test, best_name),
-                                    use_container_width=True)
-            c5,c6 = st.columns(2, gap="medium")
+                with card(f"📉 Precision-Recall Curve — {analysis_name}"):
+                    st.plotly_chart(pred.fig_pr_curve(analysis_model, analysis_Xtest, analysis_ytest, analysis_name),
+                                    width='stretch', key="pr_curve_analysis")
+            c5, c6 = st.columns(2, gap="medium")
             with c5:
-                with card(f"🕸 Metric Radar — {best_name}"):
-                    st.plotly_chart(pred.fig_metrics_radar(best_row, best_name), use_container_width=True)
+                with card(f"🕸 Metric Radar — {analysis_name}"):
+                    st.plotly_chart(pred.fig_metrics_radar(analysis_row, analysis_name), width='stretch', key="plotly_chart_26")
             with c6:
                 with card("📊 Probability Distribution"):
-                    st.plotly_chart(pred.fig_prob_distribution(best_model, best_X_test, y_test),
-                                    use_container_width=True)
-            fi_fig = pred.fig_feature_importance(best_model, feat_names, best_name)
+                    st.plotly_chart(pred.fig_prob_distribution(analysis_model, analysis_Xtest, analysis_ytest),
+                                    width='stretch', key="prob_distribution_analysis")
+
+            fi_fig = pred.fig_feature_importance(analysis_model, analysis_feats, analysis_name)
             if fi_fig:
                 with card("🔍 Feature Importances"):
-                    st.plotly_chart(fi_fig, use_container_width=True)
+                    st.plotly_chart(fi_fig, width='stretch', key="plotly_chart_28")
 
             with st.expander("📖 Metric Guide", expanded=False):
                 st.markdown(pred.BEST_METRIC_NOTE)
 
-            # ── Artefacts info ──
-            st.markdown("---")
-            st.markdown("""<p style="font-family:'Syne',sans-serif;font-size:.82rem;
-                font-weight:700;color:var(--txt1);margin-bottom:.5rem">📁 Saved Artefacts</p>""",
-                unsafe_allow_html=True)
-            art_cols = st.columns(5)
-            for ac, fname, desc in zip(art_cols,
-                ["best_model.pkl","scaler.pkl","feature_names.pkl","label_encoders.pkl","train_meta.pkl"],
-                ["Best model object","StandardScaler","Feature column list","LabelEncoders","Full training meta"]):
-                with ac:
-                    exists = pred.artefacts_exist()
-                    clr = "#00E5A0" if exists else "#FF3CAC"
-                    ico = "✅" if exists else "❌"
-                    st.markdown(f"""<div style="background:rgba(255,255,255,.03);border:1px solid
-                        rgba(255,255,255,.08);border-radius:10px;padding:.6rem .7rem;text-align:center">
-                        <div style="font-size:1.1rem">{ico}</div>
-                        <div style="font-size:.68rem;font-weight:700;color:{clr};margin:.2rem 0">{fname}</div>
-                        <div style="font-size:.62rem;color:#4A5A6E">{desc}</div>
-                    </div>""", unsafe_allow_html=True)
-
-    # ══ TAB 3 — PREDICT ═════════════════════════════════════════
-    # Hyperparameter Tuning
-    with pred_tab3:
-        _res  = st.session_state.train_result
-        _arts = None
-        if _res is None and pred.artefacts_exist():
-            _arts = pred.load_artefacts()
-
-        if _res is None and _arts is None:
-            st.markdown("""<div style="text-align:center;padding:3rem 1rem;color:var(--txt2)">
-              <div style="font-size:3rem;margin-bottom:.8rem">Tune</div>
-              <div style="font-family:'Syne',sans-serif;font-size:.95rem;font-weight:700;
-                color:var(--txt1);margin-bottom:.4rem">No Tuning Data Found</div>
-              <div style="font-size:.82rem">Run <strong>Train All Models</strong> first to populate the tuning summary for the selected best model.</div>
-            </div>""", unsafe_allow_html=True)
-        else:
-            if _res:
-                best_name    = _res["best_name"]
-                results_df   = _res["results_df"]
-                tuning_log   = _res.get("tuning_log", {})
-                search_space = _res.get("best_search_space", {})
-                comparison   = _res.get("best_model_comparison")
-            else:
-                meta         = _arts["meta"]
-                best_name    = meta["best_name"]
-                results_df   = meta["results_df"]
-                tuning_log   = meta.get("tuning_log", {})
-                search_space = meta.get("best_search_space", {})
-                comparison   = meta.get("best_model_comparison")
-
-            best_row = results_df[results_df["Model"]==best_name].iloc[0].to_dict()
-            best_info = tuning_log.get(best_name, {})
-            best_params = best_info.get("best_params", {})
-            best_cv_f1 = best_info.get("best_cv_f1")
-
-            if not best_params and search_space:
-                best_params = {k: v.get("best") for k, v in search_space.items()}
-
-            cv_display = f"{best_cv_f1:.4f}" if isinstance(best_cv_f1, (int, float)) else (best_cv_f1 if best_cv_f1 else "N/A")
-
-            st.markdown(f"""<div class="active-tab-bar">Hyperparameter Tuning: {best_name}</div>""",
-                        unsafe_allow_html=True)
-
-            c_top1, c_top2 = st.columns([1.25, 1], gap="medium")
-            with c_top1:
-                st.markdown(f"""<div class="model-info-card">
-                  <p class="model-info-h">Best Model from Train All Models</p>
-                  <div class="model-info-row"><span class="model-info-k">Model</span><span class="model-info-v">{best_name}</span></div>
-                  <div class="model-info-row"><span class="model-info-k">F1</span><span class="model-info-v">{best_row.get("F1","-")}</span></div>
-                  <div class="model-info-row"><span class="model-info-k">ROC-AUC</span><span class="model-info-v">{best_row.get("ROC-AUC","-")}</span></div>
-                  <div class="model-info-row"><span class="model-info-k">PR-AUC</span><span class="model-info-v">{best_row.get("PR-AUC","-")}</span></div>
-                  <div class="model-info-row"><span class="model-info-k">Balanced Accuracy</span><span class="model-info-v">{best_row.get("Balanced Accuracy","-")}</span></div>
-                  <div class="model-info-row"><span class="model-info-k">CV F1 (during search)</span><span class="model-info-v" style="color:#00E5A0">{cv_display}</span></div>
-                </div>""", unsafe_allow_html=True)
-            with c_top2:
-                st.markdown("""<div style="background:rgba(123,97,255,.05);border:1px solid rgba(123,97,255,.16);
-                    border-radius:14px;padding:1rem 1.1rem;margin-bottom:1rem">
-                    <p style="font-family:'Syne',sans-serif;font-size:.84rem;font-weight:700;color:#7B61FF;margin:0 0 .5rem">What this section shows</p>
-                    <div style="font-size:.76rem;color:#8A9AB8;line-height:1.7">
-                    This section is tied to the <strong style="color:#EEF2FF">best model selected in Train All Models</strong>.
-                    It shows the exact parameter values chosen for that winner, along with the tuning comparison charts.
-                    </div></div>""", unsafe_allow_html=True)
-
-            if best_params:
-                params_df = pd.DataFrame([{"Parameter": k, "Best Value": str(v)} for k, v in best_params.items()])
-                with card(f"Best Hyperparameters - {best_name}", "Selected from Train All Models"):
-                    st.dataframe(params_df, use_container_width=True, hide_index=True)
-            else:
-                st.info("No saved best-parameter record was found for the current best model. Train with tuning enabled to populate this section.")
-
-            if search_space:
-                c_mid1, c_mid2 = st.columns(2, gap="medium")
-                with c_mid1:
-                    with card("Search Space Overview"):
-                        st.plotly_chart(pred.fig_tuning_search_space(search_space, best_name), use_container_width=True)
-                with c_mid2:
-                    with card("Best Parameter Profile"):
-                        st.plotly_chart(pred.fig_best_params_bar(search_space, best_name), use_container_width=True)
-
-            if comparison:
-                c_low1, c_low2 = st.columns(2, gap="medium")
-                with c_low1:
-                    with card("Baseline vs Tuned"):
-                        st.plotly_chart(pred.fig_tuning_comparison(comparison, best_name), use_container_width=True)
-                with c_low2:
-                    with card("Metric Delta"):
-                        st.plotly_chart(pred.fig_tuning_delta(comparison, best_name), use_container_width=True)
-
-                with st.expander("Tuning Comparison Table", expanded=False):
-                    st.dataframe(pred.get_tuning_comparison(comparison), use_container_width=True, hide_index=True)
-
-    with pred_tab4:
-        # Determine active model
-        active_model  = st.session_state.model
-        active_name   = st.session_state.model_name
-        active_scaler = None
-        active_le     = None
-        active_feats  = None
-
-        if active_model is None and st.session_state.train_result:
-            res_r = st.session_state.train_result
-            active_model  = res_r["best_model"]
-            active_name   = res_r["best_name"]
-            active_scaler = res_r["scaler"]
-            active_le     = res_r["le_dict"]
-            active_feats  = res_r["feature_names"]
-
-        if active_model is None and pred.artefacts_exist():
-            _a = pred.load_artefacts()
-            if _a:
-                active_model  = _a["model"]
-                active_name   = _a["meta"]["best_name"]
-                active_scaler = _a["scaler"]
-                active_le     = _a["le_dict"]
-                active_feats  = _a["feature_names"]
+    # ══════════════════════════════════════════════════════════════
+    # TAB 4 — PREDICT  (uses production model: tuned > base)
+    # ══════════════════════════════════════════════════════════════
+    with tab4:
+        active_model, active_name, active_scaler, active_le, active_feats, is_tuned = _get_prod_model()
 
         if active_model is None:
-            st.markdown("""<div style="text-align:center;padding:3rem 1rem;color:var(--txt2)">
-              <div style="font-size:3rem;margin-bottom:.8rem">🔒</div>
-              <div style="font-family:'Syne',sans-serif;font-size:.95rem;font-weight:700;
-                color:var(--txt1);margin-bottom:.4rem">No Model Available</div>
-              <div style="font-size:.82rem">Train a model on the <strong>Train All Models</strong> tab first.</div>
-            </div>""", unsafe_allow_html=True)
+            _locked_state("🔒", "No Model Available",
+                          "Train a model on the <strong>Train All Models</strong> tab first.")
         else:
-            st.markdown(f"""<div class="active-tab-bar">🤖 Active model: {active_name}</div>""",
+            prod_badge = "<span class='tuned-badge'>TUNED ✓</span>" if is_tuned else "<span class='base-badge'>BASELINE</span>"
+            st.markdown(f"""<div class="active-tab-bar">🤖 Production Model: {active_name} {prod_badge}</div>""",
                         unsafe_allow_html=True)
 
-            st.markdown("""<div style="background:var(--surface);border:1px solid var(--border);
-                border-radius:16px;padding:1.2rem 1.1rem;margin-bottom:1rem">
-                <p style="font-family:'Syne',sans-serif;font-size:.85rem;font-weight:700;
-                color:var(--txt1);margin:0 0 1rem;display:flex;align-items:center;gap:.4rem">
-                🧾 Manual Customer Input</p>""", unsafe_allow_html=True)
+            if not is_tuned:
+                st.info("💡 Tip: Run **Hyperparameter Tuning** (Tab 2) to upgrade to the tuned production model.")
 
-            r1 = st.columns(3)
-            with r1[0]: age    = st.number_input("Age", 18, 70, 30, 1)
-            with r1[1]: gender = st.selectbox("Gender", df["Gender"].unique().tolist())
-            with r1[2]: marital= st.selectbox("Marital Status", df["MaritalStatus"].unique().tolist()
-                                              if "MaritalStatus" in df.columns else ["Single","Married","Divorced"])
-            r2 = st.columns(3)
-            with r2[0]: income      = st.number_input("Monthly Income (₹)", 10000, 100000, 35000, 1000)
-            with r2[1]: occupation  = st.selectbox("Occupation", df["Occupation"].unique().tolist())
-            with r2[2]: city_tier   = st.selectbox("City Tier", sorted(df["CityTier"].unique().tolist()))
-            r3 = st.columns(3)
-            with r3[0]: passport    = st.selectbox("Passport",[0,1],format_func=lambda x:"Yes" if x==1 else "No")
-            with r3[1]: num_trips   = st.number_input("No. of Trips",0,22,int(df["NumberOfTrips"].median()) if "NumberOfTrips" in df.columns else 3)
-            with r3[2]: pitch_sat   = st.slider("Pitch Satisfaction",1,5,3)
-            r4 = st.columns(3)
-            with r4[0]: type_contact    = st.selectbox("Type of Contact", df["TypeofContact"].unique().tolist()
-                                                       if "TypeofContact" in df.columns else ["Self Enquiry","Company Invited"])
-            with r4[1]: product_pitched = st.selectbox("Product Pitched", df["ProductPitched"].unique().tolist()
-                                                       if "ProductPitched" in df.columns else ["Basic","Standard","Deluxe","Super Deluxe","King"])
-            with r4[2]: designation     = st.selectbox("Designation", df["Designation"].unique().tolist()
-                                                       if "Designation" in df.columns else ["Executive","Manager","Senior Manager","AVP","VP"])
-            r5 = st.columns(3)
-            with r5[0]: num_person   = st.number_input("Persons Visiting",1,10,2)
-            with r5[1]: num_followups= st.number_input("Follow-ups",0,10,3)
-            with r5[2]: num_children = st.number_input("Children Visiting",0,5,1)
-            r6 = st.columns(3)
-            with r6[0]: prop_star = st.slider("Preferred Property Star",1,5,3)
-            with r6[1]: own_car   = st.selectbox("Own Car",[0,1],format_func=lambda x:"Yes" if x==1 else "No")
-            with r6[2]: duration  = st.number_input("Pitch Duration (min)",5,60,15)
-            st.markdown("</div>", unsafe_allow_html=True)
+            predict_mode = st.radio("Prediction Mode", ["👤 Single Customer","📂 Batch CSV Upload"], horizontal=True)
 
-            if st.button("🎯 Predict Conversion", use_container_width=True, type="primary"):
-                input_dict = {
-                    "Age":age,"MonthlyIncome":income,"Passport":passport,
-                    "NumberOfTrips":num_trips,"PitchSatisfactionScore":pitch_sat,
-                    "CityTier":city_tier,"Gender":gender,"Occupation":occupation,
-                    "MaritalStatus":marital,"ProductPitched":product_pitched,
-                    "Designation":designation,"TypeofContact":type_contact,
-                    "NumberOfPersonVisiting":num_person,"NumberOfFollowups":num_followups,
-                    "NumberOfChildrenVisiting":num_children,"PreferredPropertyStar":prop_star,
-                    "OwnCar":own_car,"DurationOfPitch":duration,
-                }
-                try:
-                    result = pred.predict_single(active_model, input_dict, df,
-                                                 le_dict=active_le,
-                                                 scaler=active_scaler,
-                                                 feature_names=active_feats)
-                    p=result["prediction"]; py=result["proba_yes"]; pn=result["proba_no"]
-                    if p==1:
-                        st.markdown(f"""<div class="pred-result yes">
-                        <span class="pred-ico">✅</span>
-                        <span class="pred-label" style="color:#00E5A0;-webkit-text-fill-color:#00E5A0">Will Purchase</span>
-                        <span class="pred-desc">High likelihood to convert — prioritise for follow-up</span>
-                        </div>""", unsafe_allow_html=True)
-                    else:
-                        st.markdown(f"""<div class="pred-result no">
-                        <span class="pred-ico">❌</span>
-                        <span class="pred-label" style="color:#FF3CAC;-webkit-text-fill-color:#FF3CAC">Will Not Purchase</span>
-                        <span class="pred-desc">Low probability — consider a nurture campaign</span>
-                        </div>""", unsafe_allow_html=True)
+            # ── SINGLE ──────────────────────────────────────────────
+            if predict_mode == "👤 Single Customer":
+                st.markdown("""<div style="background:var(--surface);border:1px solid var(--border);
+                    border-radius:16px;padding:1.2rem 1.1rem;margin-bottom:1rem">
+                    <p style="font-family:'Syne',sans-serif;font-size:.85rem;font-weight:700;
+                    color:var(--txt1);margin:0 0 1rem;display:flex;align-items:center;gap:.4rem">
+                    🧾 Manual Customer Input</p>""", unsafe_allow_html=True)
 
-                    st.markdown(f"""<div style="margin-top:1rem;background:var(--surface);
-                        border:1px solid var(--border);border-radius:14px;padding:1rem 1.1rem">
-                        <p style="font-family:'Syne',sans-serif;font-size:.8rem;font-weight:700;
-                        color:var(--txt1);margin:0 0 .7rem">📊 Prediction Confidence</p>
-                        <div class="prob-bar-wrap"><span class="prob-label">Will Buy</span>
-                        <div class="prob-bar-track"><div class="prob-bar-fill"
-                          style="width:{py*100:.1f}%;background:linear-gradient(90deg,#00E5A0,#00D4FF)">
-                        </div></div><span class="prob-val" style="color:#00E5A0">{py*100:.1f}%</span></div>
-                        <div class="prob-bar-wrap"><span class="prob-label">Won't Buy</span>
-                        <div class="prob-bar-track"><div class="prob-bar-fill"
-                          style="width:{pn*100:.1f}%;background:linear-gradient(90deg,#FF3CAC,#FFB547)">
-                        </div></div><span class="prob-val" style="color:#FF3CAC">{pn*100:.1f}%</span></div>
-                        </div>""", unsafe_allow_html=True)
-                    with st.expander("📋 View Input Summary"):
-                        st.dataframe(result["input_df"], use_container_width=True)
-                except Exception as e:
-                    st.error(f"Prediction failed: {e}")
-                    st.info("Tip: Train a model first on the Train All Models tab.")
+                r1 = st.columns(3)
+                with r1[0]: age    = st.number_input("Age", 18, 70, 30, 1)
+                with r1[1]: gender = st.selectbox("Gender", df["Gender"].unique().tolist())
+                with r1[2]: marital = st.selectbox("Marital Status", df["MaritalStatus"].unique().tolist() if "MaritalStatus" in df.columns else ["Single","Married","Divorced"])
+                r2 = st.columns(3)
+                with r2[0]: income     = st.number_input("Monthly Income (₹)", 10000, 100000, 35000, 1000)
+                with r2[1]: occupation = st.selectbox("Occupation", df["Occupation"].unique().tolist())
+                with r2[2]: city_tier  = st.selectbox("City Tier", sorted(df["CityTier"].unique().tolist()))
+                r3 = st.columns(3)
+                with r3[0]: passport   = st.selectbox("Passport", [0, 1], format_func=lambda x: "Yes" if x == 1 else "No")
+                with r3[1]: num_trips  = st.number_input("No. of Trips", 0, 22, int(df["NumberOfTrips"].median()) if "NumberOfTrips" in df.columns else 3)
+                with r3[2]: pitch_sat  = st.slider("Pitch Satisfaction", 1, 5, 3)
+                r4 = st.columns(3)
+                with r4[0]: type_contact     = st.selectbox("Type of Contact", df["TypeofContact"].unique().tolist() if "TypeofContact" in df.columns else ["Self Enquiry","Company Invited"])
+                with r4[1]: product_pitched  = st.selectbox("Product Pitched", df["ProductPitched"].unique().tolist() if "ProductPitched" in df.columns else ["Basic","Standard","Deluxe","Super Deluxe","King"])
+                with r4[2]: designation      = st.selectbox("Designation", df["Designation"].unique().tolist() if "Designation" in df.columns else ["Executive","Manager","Senior Manager","AVP","VP"])
+                r5 = st.columns(3)
+                with r5[0]: num_person   = st.number_input("Persons Visiting", 1, 10, 2)
+                with r5[1]: num_followups = st.number_input("Follow-ups", 0, 10, 3)
+                with r5[2]: num_children = st.number_input("Children Visiting", 0, 5, 1)
+                r6 = st.columns(3)
+                with r6[0]: prop_star = st.slider("Preferred Property Star", 1, 5, 3)
+                with r6[1]: own_car   = st.selectbox("Own Car", [0, 1], format_func=lambda x: "Yes" if x == 1 else "No")
+                with r6[2]: duration  = st.number_input("Pitch Duration (min)", 5, 60, 15)
+                st.markdown("</div>", unsafe_allow_html=True)
+
+                if st.button("🎯 Predict Conversion", width='stretch', type="primary"):
+                    input_dict = {
+                        "Age": age, "MonthlyIncome": income, "Passport": passport,
+                        "NumberOfTrips": num_trips, "PitchSatisfactionScore": pitch_sat,
+                        "CityTier": city_tier, "Gender": gender, "Occupation": occupation,
+                        "MaritalStatus": marital, "ProductPitched": product_pitched,
+                        "Designation": designation, "TypeofContact": type_contact,
+                        "NumberOfPersonVisiting": num_person, "NumberOfFollowups": num_followups,
+                        "NumberOfChildrenVisiting": num_children, "PreferredPropertyStar": prop_star,
+                        "OwnCar": own_car, "DurationOfPitch": duration,
+                    }
+                    try:
+                        result = pred.predict_single(active_model, input_dict, df,
+                                                     le_dict=active_le,
+                                                     scaler=active_scaler,
+                                                     feature_names=active_feats)
+                        p = result["prediction"]; py = result["proba_yes"]; pn = result["proba_no"]
+                        if p == 1:
+                            st.markdown(f"""<div class="pred-result yes">
+                            <span class="pred-ico">✅</span>
+                            <span class="pred-label" style="color:#00E5A0;-webkit-text-fill-color:#00E5A0">Will Purchase</span>
+                            <span class="pred-desc">High likelihood to convert — prioritise for follow-up</span>
+                            </div>""", unsafe_allow_html=True)
+                        else:
+                            st.markdown(f"""<div class="pred-result no">
+                            <span class="pred-ico">❌</span>
+                            <span class="pred-label" style="color:#FF3CAC;-webkit-text-fill-color:#FF3CAC">Will Not Purchase</span>
+                            <span class="pred-desc">Low probability — consider a nurture campaign</span>
+                            </div>""", unsafe_allow_html=True)
+
+                        st.markdown(f"""<div style="margin-top:1rem;background:var(--surface);
+                            border:1px solid var(--border);border-radius:14px;padding:1rem 1.1rem">
+                            <p style="font-family:'Syne',sans-serif;font-size:.8rem;font-weight:700;
+                            color:var(--txt1);margin:0 0 .7rem">📊 Prediction Confidence
+                            <span style="font-size:.65rem;color:#6A7D9C;font-weight:400;margin-left:.5rem">
+                            via {active_name} {("(tuned)" if is_tuned else "(baseline)")}</span></p>
+                            <div class="prob-bar-wrap"><span class="prob-label">Will Buy</span>
+                            <div class="prob-bar-track"><div class="prob-bar-fill"
+                              style="width:{py*100:.1f}%;background:linear-gradient(90deg,#00E5A0,#00D4FF)">
+                            </div></div><span class="prob-val" style="color:#00E5A0">{py*100:.1f}%</span></div>
+                            <div class="prob-bar-wrap"><span class="prob-label">Won't Buy</span>
+                            <div class="prob-bar-track"><div class="prob-bar-fill"
+                              style="width:{pn*100:.1f}%;background:linear-gradient(90deg,#FF3CAC,#FFB547)">
+                            </div></div><span class="prob-val" style="color:#FF3CAC">{pn*100:.1f}%</span></div>
+                            </div>""", unsafe_allow_html=True)
+                        with st.expander("📋 View Input Summary"):
+                            st.dataframe(result["input_df"], width='stretch')
+                    except Exception as e:
+                        st.error(f"Prediction failed: {e}")
+                        st.info("Tip: ensure the model was trained on the same dataset schema.")
+
+            # ── BATCH ───────────────────────────────────────────────
+            else:
+                st.markdown("""<div style="background:var(--surface);border:1px solid var(--border);
+                    border-radius:16px;padding:1.2rem 1.1rem;margin-bottom:1rem">
+                    <p style="font-family:'Syne',sans-serif;font-size:.85rem;font-weight:700;
+                    color:var(--txt1);margin:0 0 .5rem">📂 Upload Customer CSV</p>
+                    <p style="font-size:.75rem;color:var(--txt2);margin:0 0 .8rem;line-height:1.6">
+                    Upload a CSV with the same columns as training data (excluding ProdTaken).
+                    The model will predict conversion probability for each row.</p>""", unsafe_allow_html=True)
+
+                uploaded = st.file_uploader("Upload CSV", type=["csv"], label_visibility="collapsed")
+                st.markdown("</div>", unsafe_allow_html=True)
+
+                if uploaded:
+                    try:
+                        batch_df = pd.read_csv(uploaded)
+                        st.markdown(f"<span style='font-size:.75rem;color:var(--txt2)'>📋 {len(batch_df):,} rows × {len(batch_df.columns)} columns</span>", unsafe_allow_html=True)
+                        st.dataframe(batch_df.head(5), width='stretch')
+                        if st.button("🎯 Run Batch Predictions", width='stretch', type="primary"):
+                            with st.spinner("Running batch predictions…"):
+                                try:
+                                    out_df = pred.predict_batch(active_model, batch_df,
+                                                                le_dict=active_le,
+                                                                scaler=active_scaler,
+                                                                feature_names=active_feats)
+                                    n_yes  = int((out_df["Prediction"] == 1).sum())
+                                    n_no   = int((out_df["Prediction"] == 0).sum())
+                                    conv_r = round(n_yes / max(len(out_df), 1) * 100, 1)
+
+                                    c_b1, c_b2, c_b3 = st.columns(3)
+                                    with c_b1:
+                                        st.markdown(f"""<div class="kpi kg"><div class="kpi-ic">✅</div>
+                                          <span class="kpi-val" style="color:#00E5A0;-webkit-text-fill-color:#00E5A0">{n_yes:,}</span>
+                                          <span class="kpi-lbl">Will Purchase</span></div>""", unsafe_allow_html=True)
+                                    with c_b2:
+                                        st.markdown(f"""<div class="kpi kr"><div class="kpi-ic">❌</div>
+                                          <span class="kpi-val" style="color:#FF3CAC;-webkit-text-fill-color:#FF3CAC">{n_no:,}</span>
+                                          <span class="kpi-lbl">Will Not Purchase</span></div>""", unsafe_allow_html=True)
+                                    with c_b3:
+                                        st.markdown(f"""<div class="kpi kv"><div class="kpi-ic">📈</div>
+                                          <span class="kpi-val" style="color:#7B61FF;-webkit-text-fill-color:#7B61FF">{conv_r}%</span>
+                                          <span class="kpi-lbl">Predicted Conversion</span></div>""", unsafe_allow_html=True)
+
+                                    with card("📊 Batch Prediction Results"):
+                                        st.dataframe(out_df, width='stretch', height=320)
+
+                                    csv_bytes = out_df.to_csv(index=False).encode()
+                                    st.download_button("⬇️ Download Predictions CSV", csv_bytes,
+                                                       "predictions.csv", "text/csv",
+                                                       width='stretch')
+                                except Exception as e:
+                                    st.error(f"Batch prediction failed: {e}")
+                    except Exception as e:
+                        st.error(f"Could not read CSV: {e}")
