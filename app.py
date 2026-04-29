@@ -1146,8 +1146,8 @@ elif st.session_state.page == "prediction":
                                     st.download_button("⬇️ Download Predictions CSV", csv_bytes,
                                                        "predictions.csv", "text/csv",
                                                        width='stretch')
-                                    .\ollama
-                                    serve      except Exception as e:
+                           
+                           except Exception as e:
                                     st.error(f"Batch prediction failed: {e}")
                     except Exception as e:
                         st.error(f"Could not read CSV: {e}")
