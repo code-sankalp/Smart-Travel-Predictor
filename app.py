@@ -967,6 +967,7 @@ elif st.session_state.page == "prediction":
         active_le     = None
         active_feats  = None
 
+<<<<<<< Updated upstream
         if active_model is None and st.session_state.train_result:
             res_r = st.session_state.train_result
             active_model  = res_r["best_model"]
@@ -1079,3 +1080,13 @@ elif st.session_state.page == "prediction":
                 except Exception as e:
                     st.error(f"Prediction failed: {e}")
                     st.info("Tip: Train a model first on the Train All Models tab.")
+=======
+                                    csv_bytes = out_df.to_csv(index=False).encode()
+                                    st.download_button("⬇️ Download Predictions CSV", csv_bytes,
+                                                       "predictions.csv", "text/csv",
+                                                       width='stretch')
+                                except Exception as e:
+                                    st.error(f"Batch prediction failed: {e}")
+                    except Exception as e:
+                        st.error(f"Could not read CSV: {e}")
+>>>>>>> Stashed changes
