@@ -11,6 +11,7 @@ Stage 2 · Hyperparameter Tuning → tunes ONLY the Stage-1 winner
 """
 
 import warnings
+import os
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -247,8 +248,8 @@ if st.session_state.train_result is None and pred.base_artefacts_exist():
                 "X_train_raw"   : _meta.get("X_train_raw"),
                 "y_train_raw"   : _meta.get("y_train_raw"),
             }
-    except Exception:
-        pass  # silently skip — user sees "train first" prompt
+    except Exception as e:
+        st.warning(f"Could not load saved baseline artefacts: {e}")
 
 if st.session_state.tune_result is None and pred.tuned_artefacts_exist():
     try:
@@ -277,8 +278,8 @@ if st.session_state.tune_result is None and pred.tuned_artefacts_exist():
                 "stage"              : "tuned",
                 "tuned"              : True,
             }
-    except Exception:
-        pass  # silently skip
+    except Exception as e:
+        st.warning(f"Could not load saved tuned artefacts: {e}")
 
 # ── helpers to get current production model info ──────────────────
 def _get_prod_model():
@@ -654,10 +655,14 @@ elif st.session_state.page == "prediction":
                     result = pred.train_all_models(ana.load_cleaned(), progress_cb=_prog_cb)
                     pred.save_base_artefacts(result)
                     st.session_state.train_result = result
-                    # Clear any stale tuning result if model winner changed
-                    if (st.session_state.tune_result and
-                            st.session_state.tune_result.get("best_name") != result["best_name"]):
-                        st.session_state.tune_result = None
+                    # A new Stage-1 run invalidates any previously tuned Stage-2 model.
+                    st.session_state.tune_result = None
+                    for stale_path in (pred.TUNED_MODEL_PATH, pred.TUNED_META_PATH):
+                        try:
+                            if os.path.exists(stale_path):
+                                os.remove(stale_path)
+                        except OSError as cleanup_err:
+                            st.warning(f"Could not remove stale tuned artefact {stale_path}: {cleanup_err}")
                     prog_bar.progress(1.0); prog_text.empty()
                     best_row = result["results_df"].iloc[0]
                     st.success(
